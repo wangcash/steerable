@@ -27,6 +27,7 @@ from steerable_agent_runtime import (
     ToolRouter,
     render_skill_catalog,
     select_catalog,
+    select_pinned_loadable,
     skill_tool_descriptor,
     tool,
 )
@@ -313,6 +314,42 @@ def test_select_catalog_filters(skills_root: Path) -> None:
     assert select_catalog(provider.list(), {"tool:csv_list_rows"}, exclude=["90-csv-tools"]) == []
 
 
+def test_select_catalog_pins_suppress_listing_only(skills_root: Path) -> None:
+    provider = FilesystemSkillProvider([skills_root])
+    # `pinned` keeps an otherwise-visible catalog skill out of the listing
+    # (the host already injected its body) ...
+    assert (
+        select_catalog(
+            provider.list(),
+            {"tool:csv_list_rows"},
+            pinned=["csv-tools"],
+        )
+        == []
+    )
+    # ... but a hard exclude still wins: pinned is not an access bypass.
+    assert (
+        select_catalog(
+            provider.list(),
+            {"tool:csv_list_rows"},
+            exclude=["csv-tools"],
+            pinned=["90-csv-tools"],
+        )
+        == []
+    )
+
+
+def test_select_pinned_loadable_ignores_conditions(skills_root: Path) -> None:
+    provider = FilesystemSkillProvider([skills_root])
+    # local-exec's condition is not active, but the host pinned it and can
+    # still reload it; the readiness probe must see it as loadable.
+    pinned = select_pinned_loadable(provider.list(), ["local-exec"])
+    assert [s.name for s in pinned] == ["local-exec"]
+    # A hard mode/whitelist exclude still blocks it.
+    assert select_pinned_loadable(
+        provider.list(), ["local-exec"], exclude=["local-exec"]
+    ) == []
+
+
 def test_render_skill_catalog(skills_root: Path) -> None:
     provider = FilesystemSkillProvider([skills_root])
     catalog = select_catalog(provider.list(), {"tool:csv_list_rows", "tool:local_read_file"})
@@ -545,6 +582,35 @@ async def test_skill_tool_rejects_excluded(skills_root: Path) -> None:
     assert results[0].data["success"] is False
     tool_messages = [m for m in provider.calls[1] if m.role == "tool"]
     assert "not available in this mode" in tool_messages[0].content_text
+
+
+async def test_skill_tool_still_loads_pinned_excluded_from_catalog(skills_root: Path) -> None:
+    """Pinned is catalog suppression, not an access-control exclusion.
+
+    The host puts a pinned body in the system prompt but still needs the
+    `skill` tool to work if the model re-loads it (e.g. the eager copy was
+    truncated by the system-prompt cap). This is the regression guard for
+    `Skill 'ppt-master' is not available in this mode.`
+    """
+    provider = make_provider(
+        [{"tool_calls": [tc("skill", {"name": "csv-tools"})]}, {"content": "ok"}]
+    )
+    executor = SkillExecutor(
+        RouterToolExecutor(ToolRouter()),
+        FilesystemSkillProvider([skills_root]),
+        conditions={"tool:csv_list_rows"},
+        pinned=["csv-tools"],
+    )
+    loop = CoreLoop(provider, executor, LoopConfig())
+    events = await collect(
+        loop.run([LLMMessage.text_of("user", "hi")], tools=[skill_tool_descriptor()])
+    )
+    results = [e for e in events if e.kind == "tool_call_result"]
+    assert results[0].data["success"] is True
+    tool_messages = [m for m in provider.calls[1] if m.role == "tool"]
+    assert "<skill_content" in tool_messages[0].content_text
+    assert "csv-tools" in tool_messages[0].content_text
+    assert "CSV Tools" in tool_messages[0].content_text
 
 
 async def test_skill_executor_passes_through_other_tools(skills_root: Path) -> None:

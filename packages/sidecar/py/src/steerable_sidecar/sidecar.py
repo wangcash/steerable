@@ -111,6 +111,7 @@ from steerable_agent_runtime import (
     orchestration_tool_descriptors,
     resolve_fork_seq,
     select_catalog,
+    select_pinned_loadable,
     select_skills,
     skill_to_dict,
     skill_tool_descriptor,
@@ -2133,27 +2134,49 @@ class Sidecar:
             roots = [str(r) for r in skills_param.get("roots") or []]
             conditions = set(skills_param.get("conditions") or [])
             exclude = list(skills_param.get("exclude") or [])
+            pinned = list(skills_param.get("pinned") or [])
             ignore_conditions = bool(skills_param.get("ignoreConditions"))
             if roots:
                 skill_provider = FilesystemSkillProvider(roots)
-                if select_catalog(
+                # `pinned` only suppresses the catalog entry: the host has
+                # already injected these bodies eagerly, but the model may
+                # still call `skill` (and must get the full body if eager
+                # injection was truncated). The readiness probe therefore
+                # also counts pinned skills that survive hard exclusion, so
+                # even a turn whose only visible skill is pinned still
+                # advertises the skill tool.
+                visible_catalog = select_catalog(
                     skill_provider.list(), conditions, exclude, ignore_conditions
-                ):
-                    hooks = ChainHooks(
-                        SkillHooks(
-                            skill_provider,
-                            conditions=conditions,
-                            exclude=exclude,
-                            ignore_conditions=ignore_conditions,
-                        ),
-                        hooks,
-                    )
+                )
+                pinned_loadable = select_pinned_loadable(
+                    skill_provider.list(), pinned, exclude
+                )
+                catalog = select_catalog(
+                    skill_provider.list(),
+                    conditions,
+                    exclude,
+                    ignore_conditions,
+                    pinned,
+                )
+                if visible_catalog or pinned_loadable:
+                    if catalog:
+                        hooks = ChainHooks(
+                            SkillHooks(
+                                skill_provider,
+                                conditions=conditions,
+                                exclude=exclude,
+                                ignore_conditions=ignore_conditions,
+                                pinned=pinned,
+                            ),
+                            hooks,
+                        )
                     executor = SkillExecutor(
                         executor,
                         skill_provider,
                         conditions=conditions,
                         exclude=exclude,
                         ignore_conditions=ignore_conditions,
+                        pinned=pinned,
                     )
                     tools = [*(tools or []), skill_tool_descriptor()]
         # orchestration: opt-in advanced multi-agent seam (P3.1) — the
