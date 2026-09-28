@@ -847,6 +847,48 @@ describe('流式回合的提示词与工具面', () => {
     expect(seen[1].systemPrompt).not.toContain('旧版角色提示词');
   });
 
+  it('绑定技能走 pinned 通道，而不是混进硬排除的 exclude', async () => {
+    h.loadSkills.mockResolvedValue([
+      {
+        name: 'ppt-master',
+        dirName: 'ppt-master',
+        displayName: '',
+        description: 'PPT workflow',
+        priority: 600,
+        tags: [],
+        conditions: [],
+        match: 'any',
+        layer: 'catalog',
+        modelInvocable: true,
+        content: 'PPT-MASTER-BODY',
+        skillsDir: '/skills',
+      },
+    ]);
+    const agent = await h.store.createChatAgent({
+      name: 'PPT智能体',
+      skillIds: ['ppt-master'],
+    });
+    const chat = await h.store.createChat('对话', agent.id, null);
+    const { seen } = installStream(() => {});
+    await makeRouter().handleStream(
+      {
+        method: 'POST',
+        path: `/api/v2/chats/${chat.id}/send`,
+        body: { message: '生成PPT' },
+      },
+      makeEmitCapture().emit,
+    );
+
+    // The body is eager-injected...
+    expect(seen[0].systemPrompt).toContain('PPT-MASTER-BODY');
+    // ...and the sidecar gets it as pinned (catalog suppression) while
+    // `exclude` stays reserved for hard mode/whitelist drops. Before this
+    // split, `ppt-master` landed in exclude and the skill tool returned
+    // "not available in this mode".
+    expect(seen[0].skills.pinned).toEqual(['ppt-master']);
+    expect(seen[0].skills.exclude).not.toContain('ppt-master');
+  });
+
   it('绑定项目的会话：系统提示词追加项目围栏；信任项目时注入规则文件', async () => {
     const registry = makeProjectRegistry([
       { id: 'proj-1', name: '演示项目', folderPath: '/tmp/proj-1', trusted: true },

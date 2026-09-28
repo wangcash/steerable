@@ -2798,15 +2798,17 @@ export class LocalBackendRouter {
           ...conditionsFromTools(toolNames),
           ...(chatMode === 'plan' ? ['plan-mode'] : []),
         ],
-        // 勾选的技能正文已随系统提示词常驻，目录里不再重复列出——否则模型
-        // 会再调一次 `skill` 工具把同一份正文加载第二遍。
-        exclude: [
-          ...new Set([
-            ...excludeSkillNames,
-            ...built.modules
+        // 硬排除只放模式级/白名单排除。pinned 技能单独走 `pinned`：
+        // sidecar 不把它列进 catalog（宿主已 eager 注入正文），但仍允许
+        // `skill` 工具按需加载完整正文；否则大技能被 system prompt cap
+        // 截断后，模型重载会被误报成“not available in this mode”。
+        exclude: [...new Set(excludeSkillNames)],
+        pinned: [
+          ...new Set(
+            built.modules
               .filter((m) => isSkillPinned(m, capability.pinnedSkills))
               .map((m) => m.dirName || m.name),
-          ]),
+          ),
         ],
         ignoreConditions: capability.loadAllSkills,
       };
