@@ -8,7 +8,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import { getElectronBridge, type AskUserPromptRequest } from '@/lib/electron-bridge';
+import { getHostBridge, type AskUserPromptRequest } from '@/lib/host-bridge';
 import { bindPromptToActiveChat, promptVisibleInChat } from './prompt-chat-scope';
 
 type AnswerValue = string | string[];
@@ -35,7 +35,7 @@ export function AskUserPromptProvider({ children }: { children: ReactNode }) {
   const answeredRequestIds = useRef(new Set<string>());
 
   useEffect(() => {
-    const bridge = getElectronBridge();
+    const bridge = getHostBridge();
     if (!bridge?.askUser) return;
     let active = true;
     const addRequests = (
@@ -65,7 +65,7 @@ export function AskUserPromptProvider({ children }: { children: ReactNode }) {
         if (active) addRequests(requests, 'prepend');
       })
       .catch((error) => {
-        console.error('恢复待回答问题失败:', error);
+        console.error('Failed to restore pending questions:', error);
       });
     return () => {
       active = false;
@@ -75,7 +75,7 @@ export function AskUserPromptProvider({ children }: { children: ReactNode }) {
 
   const answer = useCallback(
     (requestId: string, answers: Record<string, AnswerValue>) => {
-      const bridge = getElectronBridge();
+      const bridge = getHostBridge();
       answeredRequestIds.current.add(requestId);
       setQueue((previous) => previous.filter((request) => request.requestId !== requestId));
       void bridge?.askUser?.answer({ requestId, answers });

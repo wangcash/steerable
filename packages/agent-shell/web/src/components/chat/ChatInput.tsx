@@ -36,6 +36,8 @@ import { hostClipboardAvailable, requestHostPaste, type HostClipboardFile } from
 import { attachmentFromPath, type AttachmentFile } from '@/lib/attachments';
 import { dropPointHitsRect, hostFileDropAvailable, listenHostFileDrop } from '@/lib/host-file-drop';
 import type { SteerOutcome } from '@steerable/agent-ui';
+import { t } from '@/i18n';
+import { agentLabel } from '@/i18n/agent-label';
 import {
   isHiddenSlashSkill,
   resolveSlashTool,
@@ -83,7 +85,10 @@ export type { ExecPolicy, McpToolItem, SkillItem };
  *   - Compact-mode responsive layout.
  */
 
-const MIN_HEIGHT_PX = 36;
+// Empty field should read as two lines of space. Two lines of text measure
+// 40px (`pt-2` + two 16px line boxes) and still look like one row, so the
+// floor is one line box taller.
+const MIN_HEIGHT_PX = 56;
 const MAX_HEIGHT_PX = 220;
 const MENTION_PATTERN = /(@[^\s@]+)/g;
 const MAX_MENTION_SUGGESTIONS = 8;
@@ -278,11 +283,11 @@ function parseMentionSegments(
       if (!ranges.some((range) => offset < range.end && end > range.start)) {
         const name = match.slice(1);
         const agent = agents.find((a) => a.name === name || a.slug === name);
-        const chat = chats.find((c) => (c.title || '未命名对话') === name);
+        const chat = chats.find((c) => (c.title || t('Untitled chat')) === name);
         const ref: MentionReference | undefined = agent
           ? { type: 'agent', id: agent.id, label: agent.name }
           : chat
-            ? { type: 'chat', id: chat.id, label: chat.title || '未命名对话' }
+            ? { type: 'chat', id: chat.id, label: chat.title || t('Untitled chat') }
             : undefined;
 
         ranges.push({ start: offset, end, text: match, ref });
@@ -373,7 +378,7 @@ function writeEditorValue(
       const isChat = seg.ref?.type === 'chat';
       const isSkill = seg.ref?.type === 'skill';
       const isMcp = seg.ref?.type === 'mcp';
-      const removeLabel = `移除 ${seg.text}`;
+      const removeLabel = t('Remove {name}', { name: seg.text });
 
       const chip = document.createElement('button');
       chip.type = 'button';
@@ -778,7 +783,7 @@ function AttachmentChip({
         type="button"
         onClick={onRemove}
         className="flex h-4 w-4 items-center justify-center rounded-full text-agent-muted-foreground transition-colors hover:bg-agent-foreground/10 hover:text-agent-foreground"
-        aria-label={`移除文件 ${file.name}`}
+        aria-label={t('Remove file {name}', { name: file.name })}
       >
         <LuX className="h-3 w-3" />
       </button>
@@ -799,7 +804,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
       onRemoveFollowUp,
       isStreaming = false,
       disabled = false,
-      placeholder = '向 Agent 发送消息…',
+      placeholder = t('Message the Agent...'),
       currentAgent,
       agents = [],
       chats = [],
@@ -941,8 +946,10 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
         .map((chat) => ({
           type: 'chat',
           id: chat.id,
-          label: chat.title || '未命名对话',
-          description: chat.updatedAt ? `历史对话 · ${new Date(chat.updatedAt).toLocaleString()}` : '历史对话',
+          label: chat.title || t('Untitled chat'),
+          description: chat.updatedAt
+            ? t('Past chat · {time}', { time: new Date(chat.updatedAt).toLocaleString() })
+            : t('Past chat'),
         }));
 
       return [...agentSuggestions, ...chatSuggestions].slice(0, MAX_MENTION_SUGGESTIONS);
@@ -1042,11 +1049,11 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
       const mcpGroup = suggestions.filter((s) => s.kind === 'mcp');
       let idx = 0;
       if (skillGroup.length > 0) {
-        rows.push({ type: 'header', label: '指定运行的本地技能 (Skill)' });
+        rows.push({ type: 'header', label: t('Run a local skill (Skill)') });
         for (const s of skillGroup) rows.push({ type: 'item', item: s, idx: idx++ });
       }
       if (mcpGroup.length > 0) {
-        rows.push({ type: 'header', label: '指定调用的 MCP 工具 (MCP Tool)' });
+        rows.push({ type: 'header', label: t('Call an MCP tool (MCP Tool)') });
         for (const s of mcpGroup) rows.push({ type: 'item', item: s, idx: idx++ });
       }
       return rows;
@@ -1247,11 +1254,13 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
       setIsDragging(false);
     };
 
-    // 把新文件并入列表：按 path（有路径时）或 name（浏览器模式无路径）去重。
+    // 桌面壳的真实 path 可去重；浏览器 File 没有 path，同名文件可能来自
+    // 不同目录，必须全部保留，提交落盘时由宿主生成唯一文件名。
     const addFiles = (incoming: AttachmentFile[]) => {
-      const keyOf = (f: AttachmentFile) => f.path || f.name;
-      const existingKeys = new Set(actualFiles.map(keyOf));
-      const filteredNewFiles = incoming.filter((f) => !existingKeys.has(keyOf(f)));
+      const existingPaths = new Set(actualFiles.map((file) => file.path).filter(Boolean));
+      const filteredNewFiles = incoming.filter(
+        (file) => !file.path || !existingPaths.has(file.path),
+      );
       if (filteredNewFiles.length > 0) {
         actualOnFilesChange([...actualFiles, ...filteredNewFiles]);
       }
@@ -1342,9 +1351,11 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
       if (value[removeEnd] === ' ') removeEnd += 1;
       replaceRange(start, removeEnd, '');
       if (ref) {
-        setMentionReferences((prev) =>
-          prev.filter((item) => !(item.type === ref.type && item.id === ref.id)),
+        const nextReferences = mentionReferences.filter(
+          (item) => !(item.type === ref.type && item.id === ref.id),
         );
+        setMentionReferences(nextReferences);
+        onMentionReferencesChange?.(nextReferences);
       }
     };
 
@@ -1567,12 +1578,14 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
     };
 
     const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-      if (
-        hostClipboardAvailable() &&
+      // Cmd/Ctrl+V never reaches a paste event when the app menu owns the
+      // shortcut, and WKWebView leaves that event's clipboard empty. Read the
+      // OS pasteboard instead. Match `code` too: with an IME, `key` may not be "v".
+      const pasteShortcut =
         (event.metaKey || event.ctrlKey) &&
         !event.altKey &&
-        event.key.toLowerCase() === 'v'
-      ) {
+        (event.key.toLowerCase() === 'v' || event.key === '\u0016' || event.code === 'KeyV');
+      if (hostClipboardAvailable() && pasteShortcut) {
         event.preventDefault();
         requestHostPaste(event.currentTarget);
         return;
@@ -1677,24 +1690,29 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
         event.key === 'Enter' && !event.shiftKey;
       if (isSendCombo) {
         event.preventDefault();
+        const submittedText = getEditableText(event.currentTarget).trim();
         // streaming 期间：Enter = follow-up 排队（本轮结束后自动作为下一轮
         // 发出）；⌘/Ctrl+Enter = 轮中插队（注入运行中的回合；注入不了时
         // hook 兜底为 W6-2 排队或新回合直发，消息不会丢）。
         if (isStreaming) {
-          if ((event.metaKey || event.ctrlKey) && onSteer && trimmed) {
-            void onSteer(trimmed).then((outcome) => {
+          if ((event.metaKey || event.ctrlKey) && onSteer && submittedText) {
+            void onSteer(submittedText).then((outcome) => {
               // steered / queued / sent 三种结果消息都已落地（注入当前回合 /
               // 进入待发队列 / 作为新回合发出），草稿都可以清；queued 额外
               // 提示用户"不是追加进当前回合"。
               if (outcome === 'queued') {
-                showSteerNotice('当前回合无法插队，已改为排队，本轮结束后自动发出');
+                showSteerNotice(
+                  t(
+                    'This turn cannot take an interjection. The message was queued and will be sent when this turn ends.',
+                  ),
+                );
               }
               onChange('');
             });
             return;
           }
-          if (onFollowUp && trimmed) {
-            onFollowUp(trimmed);
+          if (onFollowUp && submittedText) {
+            onFollowUp(submittedText);
             onChange('');
           }
           return;
@@ -1774,7 +1792,9 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
             onAutoContinue={() => askUserPrompt.answer({})}
             bottomHint={
               askUserPrompt.pendingCount > 0
-                ? `还有 ${askUserPrompt.pendingCount} 组问题待回答`
+                ? t('{count} more question groups to answer', {
+                    count: askUserPrompt.pendingCount,
+                  })
                 : undefined
             }
           />
@@ -1814,7 +1834,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
         {mentionQuery && mentionSuggestions.length > 0 && (
           <div className="absolute bottom-full left-3 z-50 mb-1 max-h-72 w-80 max-w-[calc(100%-0.75rem)] overflow-y-auto rounded-agent-md border border-agent-border bg-agent-canvas p-1 shadow-lg">
             <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-agent-muted-foreground">
-              @ 选择 Agent 或历史对话
+              {t('@ Choose an Agent or past chat')}
             </div>
             {mentionSuggestions.map((item, idx) => (
               <button
@@ -1848,7 +1868,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
                   <span className="flex items-center gap-1.5">
                     <span className="truncate text-xs font-medium">@{item.label}</span>
                     <span className="shrink-0 rounded-full bg-agent-muted px-1.5 py-0.5 text-[10px] text-agent-muted-foreground">
-                      {item.type === 'agent' ? 'Agent' : '对话'}
+                      {item.type === 'agent' ? 'Agent' : t('Chat')}
                     </span>
                   </span>
                   {item.description && (
@@ -1901,7 +1921,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
                         <div className="text-xs font-medium truncate">
                           {row.item.skill.displayName ? (
                             <>
-                              {row.item.skill.displayName}
+                              {t(row.item.skill.displayName)}
                               <span className="ml-1.5 text-[10px] font-normal text-agent-muted-foreground/70">
                                 /{row.item.skill.name}
                               </span>
@@ -1956,7 +1976,10 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
           {pendingFollowUps.length > 0 && (
             <div className="flex flex-col gap-1 border-b border-agent-border bg-agent-muted/30 px-2.5 py-1.5">
               <div className="text-[11px] font-medium text-agent-muted-foreground">
-                排队中（{pendingFollowUps.length}）· 本轮结束后自动发出 · 停止后恢复到输入框
+                {t(
+                  'Queued ({count}) · Sent when this turn ends · Restored to the input box if stopped',
+                  { count: pendingFollowUps.length },
+                )}
               </div>
               {pendingFollowUps.map((text, i) => (
                 <div
@@ -1967,7 +1990,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
                   {onRemoveFollowUp && (
                     <button
                       type="button"
-                      aria-label={`撤回排队消息 ${i + 1}`}
+                      aria-label={t('Withdraw queued message {index}', { index: i + 1 })}
                       onClick={() => onRemoveFollowUp(i)}
                       className="shrink-0 text-agent-muted-foreground opacity-0 transition-opacity hover:text-agent-destructive group-hover:opacity-100"
                     >
@@ -2059,8 +2082,8 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
                 onClick={handlePickFiles}
                 disabled={disabled || isStreaming}
                 className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-agent-muted-foreground transition-colors hover:bg-agent-foreground/5 hover:text-agent-foreground disabled:cursor-not-allowed disabled:opacity-50"
-                title="上传文件，或在输入框粘贴图片"
-                aria-label="上传文件"
+                title={t('Upload files, or paste images into the input box')}
+                aria-label={t('Upload files')}
                 data-testid="chat-attach"
               >
                 <LuPaperclip className="h-3 w-3" />
@@ -2093,7 +2116,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
                         <kbd className="rounded border border-agent-border bg-agent-muted px-1 font-sans text-[10px]">
                           Enter
                         </kbd>
-                        <span className="ml-1">排队</span>
+                        <span className="ml-1">{t('Queue')}</span>
                       </span>
                     )}
                     {onSteer && (
@@ -2105,14 +2128,14 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
                         <kbd className="rounded border border-agent-border bg-agent-muted px-1 font-sans text-[10px]">
                           Enter
                         </kbd>
-                        <span className="ml-1">插队</span>
+                        <span className="ml-1">{t('Interject')}</span>
                       </span>
                     )}
                     <span className="ml-2">
                       <kbd className="rounded border border-agent-border bg-agent-muted px-1 font-sans text-[10px]">
                         Esc
                       </kbd>
-                      <span className="ml-1">停止</span>
+                      <span className="ml-1">{t('Stop')}</span>
                     </span>
                   </>
                 ) : (
@@ -2120,7 +2143,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
                     <kbd className="rounded border border-agent-border bg-agent-muted px-1 font-sans text-[10px]">
                       Enter
                     </kbd>
-                    <span className="ml-1">发送</span>
+                    <span className="ml-1">{t('Send')}</span>
                     <span className="ml-2">
                       <kbd className="rounded border border-agent-border bg-agent-muted px-1 font-sans text-[10px]">
                         Shift
@@ -2129,7 +2152,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
                       <kbd className="rounded border border-agent-border bg-agent-muted px-1 font-sans text-[10px]">
                         Enter
                       </kbd>
-                      <span className="ml-1">换行</span>
+                      <span className="ml-1">{t('New line')}</span>
                     </span>
                   </>
                 )}
@@ -2149,11 +2172,14 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
                 title={
                   isStreaming
                     ? pendingFollowUps.length > 0
-                      ? `停止生成 (Esc) · ${pendingFollowUps.length} 条排队消息将恢复到输入框`
-                      : '停止生成 (Esc)'
-                    : '发送 (Enter)'
+                      ? t(
+                          'Stop generating (Esc) · {count} queued messages will be restored to the input box',
+                          { count: pendingFollowUps.length },
+                        )
+                      : t('Stop generating (Esc)')
+                    : t('Send (Enter)')
                 }
-                aria-label={isStreaming ? '停止生成' : '发送消息'}
+                aria-label={isStreaming ? t('Stop generating') : t('Send message')}
                 data-testid="chat-send"
               >
                 {isStreaming ? (
@@ -2171,7 +2197,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
 );
 
 function agentInitial(agent: LocalChatAgent): string {
-  return agent.name.trim()[0]?.toUpperCase() ?? 'A';
+  return agentLabel(agent).trim()[0]?.toUpperCase() ?? 'A';
 }
 
 /**
@@ -2193,7 +2219,7 @@ function ModeToggle({
     <div
       className="inline-flex h-6 shrink-0 items-center rounded-full border border-agent-border bg-agent-canvas p-0.5"
       role="radiogroup"
-      aria-label="对话模式"
+      aria-label={t('Chat mode')}
       data-testid="mode-toggle"
     >
       <button
@@ -2202,7 +2228,7 @@ function ModeToggle({
         aria-checked={mode === 'agent'}
         disabled={disabled}
         onClick={() => onChange('agent')}
-        title="Agent 模式：直接执行任务"
+        title={t('Agent mode: carry out the task directly')}
         data-testid="mode-agent"
         className={[
           'inline-flex h-5 items-center gap-1 rounded-full px-1.5 text-[12px] leading-[1.45] transition-colors disabled:cursor-not-allowed disabled:opacity-70',
@@ -2220,7 +2246,7 @@ function ModeToggle({
         aria-checked={mode === 'plan'}
         disabled={disabled}
         onClick={() => onChange('plan')}
-        title="Plan 模式：先制定计划，只读不执行"
+        title={t('Plan mode: make a plan first, read only and no execution')}
         data-testid="mode-plan"
         className={[
           'inline-flex h-5 items-center gap-1 rounded-full px-1.5 text-[12px] leading-[1.45] transition-colors disabled:cursor-not-allowed disabled:opacity-70',
@@ -2267,14 +2293,14 @@ function AgentSelect({
 
   const buttonTitle = useMemo(() => {
     const activeNames = [
-      agent.name,
+      agentLabel(agent),
       ...mentionReferences
         .filter((ref) => ref.type === 'agent' && ref.id !== agent.id)
         .map((ref) => ref.label),
     ].filter(Boolean) as string[];
 
-    return `当前激活专家：${activeNames.join(', ')}`;
-  }, [agent.name, agent.id, mentionReferences]);
+    return t('Active experts: {names}', { names: activeNames.join(', ') });
+  }, [agent, mentionReferences]);
 
   return (
     <div
@@ -2293,7 +2319,7 @@ function AgentSelect({
       >
         <AgentDot agent={agent} />
         <span className="truncate font-medium">
-          {agent.name}
+          {agentLabel(agent)}
           {mentionedAgentCount > 0 ? ` +${mentionedAgentCount}` : ''}
         </span>
         <LuChevronDown className="h-3 w-3 shrink-0 text-agent-muted-foreground" />
@@ -2305,7 +2331,7 @@ function AgentSelect({
           className="absolute bottom-full left-0 z-50 mb-1 max-h-64 w-72 overflow-y-auto rounded-agent-md border border-agent-border bg-agent-canvas p-1 shadow-lg"
         >
           <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-agent-muted-foreground">
-            选择专家
+            {t('Choose an expert')}
           </div>
           {agents.map((item) => {
             const isPrimary = item.id === agent.id;
@@ -2332,16 +2358,16 @@ function AgentSelect({
                 <span className="min-w-0 flex-1">
                   <span className="flex items-center gap-1.5">
                     <span className="block truncate text-xs font-medium">
-                      {item.name}
+                      {agentLabel(item)}
                     </span>
                     {isPrimary && (
                       <span className="inline-flex items-center rounded bg-agent-foreground/10 px-1 py-0.5 text-[9px] font-medium text-agent-foreground">
-                        当前
+                        {t('Current')}
                       </span>
                     )}
                     {!isPrimary && isMentioned && (
                       <span className="inline-flex items-center rounded bg-agent-muted px-1 py-0.5 text-[9px] font-medium text-agent-muted-foreground border border-agent-border">
-                        已引入
+                        {t('Mentioned')}
                       </span>
                     )}
                   </span>
@@ -2366,7 +2392,7 @@ function AgentSelect({
             className="mt-0.5 flex w-full items-center gap-2 rounded border-t border-agent-border/50 px-2 py-2 text-left text-agent-muted-foreground transition-colors hover:bg-agent-foreground/5 hover:text-agent-foreground"
           >
             <LuBot className="h-3.5 w-3.5 shrink-0" />
-            <span className="text-xs font-medium">管理智能体</span>
+            <span className="text-xs font-medium">{t('Manage agents')}</span>
           </button>
           )}
         </div>

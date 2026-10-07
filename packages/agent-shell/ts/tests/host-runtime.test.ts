@@ -9,7 +9,12 @@
  *  - read_state.seed 处理器校验入参形状并返回 seeded 计数；
  *  - shutdown 逆序停包装配、杀终端、停 sidecar。
  */
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+process.env.DEEPPATH_USER_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'host-runtime-'));
 
 const mocks = vi.hoisted(() => ({
   setDefaultExecTimeoutMs: vi.fn(),
@@ -31,6 +36,9 @@ const mocks = vi.hoisted(() => ({
   refreshAllEnabled: vi.fn(async () => {}),
   seedProductServers: vi.fn(),
   setTaskServices: vi.fn(),
+  setLoopMonitor: vi.fn(),
+  loopMonitorConstructed: vi.fn(),
+  loopMonitorDispose: vi.fn(),
   registerToolContributions: vi.fn(),
   listModelSchemas: vi.fn(() => []),
   packAssemblies: new Map<string, (deps: unknown) => unknown>(),
@@ -58,6 +66,7 @@ vi.mock('../src/terminal-manager.js', () => ({
 vi.mock('../src/tool-router.js', () => ({
   ToolRouter: class {
     setTaskServices = mocks.setTaskServices;
+    setLoopMonitor = mocks.setLoopMonitor;
     registerToolContributions = mocks.registerToolContributions;
     listModelSchemas = mocks.listModelSchemas;
   },
@@ -79,6 +88,15 @@ vi.mock('../src/local-backend/router.js', () => ({
   LocalBackendRouter: class {
     resolveChatProject = vi.fn(() => null);
     resolveChatWorkspaceRoot = vi.fn(async () => '/tmp/chat-ws');
+    wakeChat = vi.fn(async () => ({ started: true }));
+  },
+}));
+vi.mock('../src/local-backend/loop-pty-monitor.js', () => ({
+  LoopPtyMonitor: class {
+    dispose = mocks.loopMonitorDispose;
+    constructor(...args: unknown[]) {
+      mocks.loopMonitorConstructed(...args);
+    }
   },
 }));
 vi.mock('../src/local-backend/worktree-service.js', () => ({ WorktreeService: class {} }));
@@ -94,6 +112,7 @@ vi.mock('../src/storage/driver.js', () => {
   return {
     LOCAL_SCOPE: { tenantId: 'local', userId: 'local' },
     initializeStorage: vi.fn(async () => {}),
+    watchStorageChanges: vi.fn(),
     closeStorage: vi.fn(async () => {}),
     getScopedStore: () => store,
     getPackDbAccess: () => ({ scope: { tenantId: 'local', userId: 'local' } }),
@@ -154,6 +173,8 @@ describe('createHostRuntime · 装配', () => {
     expect(rt.taskService).toBeDefined();
     expect(rt.localBackendRouter).toBeDefined();
     expect(mocks.setTaskServices).toHaveBeenCalledOnce();
+    expect(mocks.loopMonitorConstructed).toHaveBeenCalledOnce();
+    expect(mocks.setLoopMonitor).toHaveBeenCalledOnce();
     expect(mocks.bindWorkspaceSkillRoots).toHaveBeenCalledOnce();
     expect(mocks.seedProductServers).toHaveBeenCalledOnce();
   });
@@ -239,6 +260,23 @@ describe('start · 生命周期', () => {
     expect(await bootDeps.resolveAdditionalWriteRoots('chat-1')).toEqual([]);
   });
 
+  it('包声明的可写根跟着每次工具调用走', async () => {
+    const { registerPackTurnHooks, resetPackTurnHooks } = await import('../src/local-backend/pack-turn-hooks.js');
+    registerPackTurnHooks('test-pack-roots', {
+      execWritableRoots: () => ['/tmp/pack-root'],
+    });
+    try {
+      const rt = await createHostRuntime(makeOptions());
+      await rt.start();
+      const bootDeps = mocks.startHostSidecar.mock.calls.at(-1)?.[0] as {
+        resolveAdditionalWriteRoots: (chatId: string) => Promise<string[]>;
+      };
+      expect(await bootDeps.resolveAdditionalWriteRoots('chat-1')).toEqual(['/tmp/pack-root']);
+    } finally {
+      resetPackTurnHooks();
+    }
+  });
+
   it('read_state.seed 处理器：合法 state 透传并回 seeded；畸形入参按空表处理', async () => {
     mocks.seedReadState.mockReturnValue(5);
     const rt = await createHostRuntime(makeOptions());
@@ -269,6 +307,20 @@ describe('start · 生命周期', () => {
     expect(mocks.terminalEnsurePrimary).toHaveBeenCalledOnce();
     const onLog = (options as never as { onLog: ReturnType<typeof vi.fn> }).onLog;
     expect(onLog).toHaveBeenCalledWith(expect.stringContaining('pty unavailable'));
+    vi.useRealTimers();
+  });
+
+  it('关停后不再预热终端', async () => {
+    vi.useFakeTimers();
+    try {
+      const rt = await createHostRuntime(makeOptions());
+      await rt.start();
+      await rt.shutdown();
+      vi.advanceTimersByTime(2_100);
+      expect(mocks.terminalEnsurePrimary).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -280,6 +332,7 @@ describe('shutdown', () => {
     const rt = await createHostRuntime(makeOptions());
     await rt.shutdown();
     expect(mocks.terminalKillAll).toHaveBeenCalledOnce();
+    expect(mocks.loopMonitorDispose).toHaveBeenCalledOnce();
     expect(order).toEqual(['b', 'a']);
     expect(mocks.shutdownHostSidecar).toHaveBeenCalledOnce();
   });

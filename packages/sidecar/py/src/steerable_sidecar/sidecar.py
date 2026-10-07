@@ -144,6 +144,15 @@ from .stream_chunks import RawChunkBridgeHooks
 
 logger = logging.getLogger("steerable_sidecar")
 
+_AUTO_APPROVED_HOST_CONTROL_TOOLS = (
+    "get_goal",
+    "create_goal",
+    "update_goal",
+    "loop_create",
+    "loop_list",
+    "loop_stop",
+)
+
 PROTOCOL_VERSION = "0.1.0"
 
 # asyncio's default 64 KiB StreamReader limit kills the read loop with
@@ -1895,10 +1904,11 @@ class Sidecar:
             # In-project file targets do not ask. Roots come from the host's
             # project fence (still sent when 「完整权限」 turns the OS sandbox
             # off). The exec sandbox list is the fallback for callers that
-            # only set that. The prompt stays for paths outside those roots
-            # and for tools whose paths we cannot see (shell). allow_once is
-            # not cached, so the next call is judged on its own paths. Sits
-            # under policy rules so an explicit deny still wins.
+            # only set that. Shell calls skip the prompt only while that
+            # sandbox is actually on and the cwd stays in the roots; with
+            # the sandbox off, or a cwd outside the roots, the prompt stays.
+            # allow_once is not cached, so the next call is judged on its
+            # own paths. Sits under policy rules so an explicit deny still wins.
             raw_roots = approval.get("writableRoots")
             if (
                 not raw_roots
@@ -1918,11 +1928,16 @@ class Sidecar:
                     amendment_sink=amendment_sink,
                     chat_id=approval_chat_id,
                 )
-                if not writable_roots:
-                    return host
                 from steerable_agent_runtime.approval import WorkspaceAutoApprover
 
-                return WorkspaceAutoApprover(host, writable_roots)
+                return WorkspaceAutoApprover(
+                    host,
+                    writable_roots,
+                    sandbox_enforced=bool(
+                        isinstance(exec_sandbox, dict) and exec_sandbox.get("enabled")
+                    ),
+                    auto_allow_tools=_AUTO_APPROVED_HOST_CONTROL_TOOLS,
+                )
 
             if policy_path:
                 from steerable_agent_runtime import (

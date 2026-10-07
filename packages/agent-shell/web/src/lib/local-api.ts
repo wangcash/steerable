@@ -1,18 +1,18 @@
 /**
- * Typed wrappers around `window.electron.localBackend.request` for the
+ * Typed wrappers around `window.steerableHost.localBackend.request` for the
  * endpoints that apps/web actually consumes today. Shapes follow what
  * `src/local-backend/router.ts` returns — see the corresponding route
  * handlers there if you need to add fields.
  *
  * Conventions:
- *   - Every helper throws if the bridge is missing (caller should `isElectron()`
+ *   - Every helper throws if the bridge is missing (caller should `hasHostBridge()`
  *     check first if a graceful degradation is needed).
  *   - We deliberately keep the local return shapes (not Pydantic / protocol
  *     types) — they're the contract between local-backend and renderer, and
  *     may drift from any public cloud API. Aligning the two is out of scope.
  */
 
-import { getElectronBridge } from './electron-bridge';
+import { getHostBridge } from './host-bridge';
 
 export interface LocalChat {
   id: string;
@@ -100,10 +100,10 @@ interface CreateChatResponse {
 }
 
 function bridge() {
-  const b = getElectronBridge();
+  const b = getHostBridge();
   if (!b) {
     throw new Error(
-      'Electron bridge unavailable — local API can only be used inside the desktop shell.',
+      'Host bridge unavailable — local API can only be used inside the desktop shell.',
     );
   }
   return b;
@@ -341,6 +341,60 @@ export async function getChatLiveStream(chatId: string) {
   });
 }
 
+export interface LocalGoal {
+  id: string;
+  chatId: string;
+  revision: number;
+  objective: string;
+  phase: 'active' | 'paused' | 'blocked' | 'complete';
+  blockedReason?: string;
+  turns: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export async function getChatGoal(chatId: string) {
+  return bridge().localBackend.request<{ goal: LocalGoal | null }>({
+    method: 'GET',
+    path: `/api/v2/chats/${encodeURIComponent(chatId)}/goal`,
+  });
+}
+
+export async function updateChatGoal(
+  chatId: string,
+  body:
+    | { action: 'edit'; objective: string }
+    | { action: 'pause' | 'resume' | 'complete' | 'clear' },
+) {
+  return bridge().localBackend.request<{ goal: LocalGoal | null }>({
+    method: 'POST',
+    path: `/api/v2/chats/${encodeURIComponent(chatId)}/goal`,
+    body,
+  });
+}
+
+export interface LocalMonitoredLoop {
+  id: string;
+  chatId: string;
+  terminalSessionId: string;
+  prompt: string;
+  intervalSeconds: number;
+}
+
+export async function listChatLoops(chatId: string) {
+  return bridge().localBackend.request<{ loops: LocalMonitoredLoop[] }>({
+    method: 'GET',
+    path: `/api/v2/chats/${encodeURIComponent(chatId)}/loops`,
+  });
+}
+
+export async function stopChatLoop(chatId: string, loopId: string) {
+  return bridge().localBackend.request<{ success: boolean }>({
+    method: 'DELETE',
+    path: `/api/v2/chats/${encodeURIComponent(chatId)}/loops/${encodeURIComponent(loopId)}`,
+  });
+}
+
 /** 按 chatId 取消运行中的回合（切回后新挂载的视图手里没有原 streamId）。 */
 export async function cancelChatTurn(chatId: string) {
   return bridge().localBackend.request<{ success: boolean; reason?: string }>({
@@ -391,6 +445,8 @@ export interface LocalProject {
   sourceFolders?: string[];
   /** W6-5: 信任后该项目目录里的规则文件才会注入模型上下文。缺省 false。 */
   trusted?: boolean;
+  /** 侧边栏顺序，越小越靠前。缺省时列表顺序由服务端决定。 */
+  sortOrder?: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -513,6 +569,15 @@ export async function updateProject(
     method: 'PUT',
     path: `/api/v2/projects/${encodeURIComponent(projectId)}`,
     body: updates,
+  });
+}
+
+/** 按 id 顺序保存侧栏项目排序。服务端忽略未知 id，没提到的项目接在后面。 */
+export async function reorderProjects(orderedIds: string[]) {
+  return bridge().localBackend.request<{ success: boolean; projects: LocalProject[] }>({
+    method: 'PUT',
+    path: '/api/v2/projects/order',
+    body: { orderedIds },
   });
 }
 
@@ -736,6 +801,25 @@ export async function getSidecarSandboxPosture() {
   });
 }
 
+/** 当前 DeepSeek / Kimi 密钥在供应商侧的真实余额。其他厂商为 unsupported。 */
+export interface LlmAccount {
+  status: 'ready' | 'unsupported' | 'missing_key' | 'failed';
+  provider: 'deepseek' | 'moonshot' | null;
+  label: string;
+  available: boolean | null;
+  currency: string | null;
+  total: string | null;
+  granted: string | null;
+  toppedUp: string | null;
+}
+
+export async function getLlmAccount(refresh = false) {
+  return bridge().localBackend.request<LlmAccount>({
+    method: 'GET',
+    path: refresh ? '/api/v2/llm/account?refresh=1' : '/api/v2/llm/account',
+  });
+}
+
 export async function getLlmSettings() {
   return bridge().localBackend.request<LlmSettings>({
     method: 'GET',
@@ -743,12 +827,17 @@ export async function getLlmSettings() {
   });
 }
 
+/** 模型设置保存后通知侧栏重新读取供应商余额。 */
+export const LLM_SETTINGS_CHANGED_EVENT = 'steerable:llm-settings-changed';
+
 export async function setLlmSettings(input: LlmSettings) {
-  return bridge().localBackend.request<LlmSettings>({
+  const saved = await bridge().localBackend.request<LlmSettings>({
     method: 'POST',
     path: '/api/v2/local-settings/llm',
     body: input,
   });
+  window.dispatchEvent(new Event(LLM_SETTINGS_CHANGED_EVENT));
+  return saved;
 }
 
 /* ---------------- LLM link diagnosis ---------------- */
@@ -765,6 +854,14 @@ export interface DiagnoseResult {
   steps: DiagnoseStep[];
   ambientProxies: string[];
   hint: string | null;
+}
+
+export async function installCommandLineTool(name: string) {
+  return bridge().localBackend.request<{ path: string; onPath: boolean }>({
+    method: 'POST',
+    path: '/api/v2/cli/install',
+    body: { name },
+  });
 }
 
 export async function diagnoseLlmConnection(input: {

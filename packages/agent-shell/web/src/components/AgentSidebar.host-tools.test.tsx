@@ -4,7 +4,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { ElectronBridge } from '@/lib/electron-bridge';
+import type { HostBridge } from '@/lib/host-bridge';
 import type { UseChatsAndAgentsResult } from '@/hooks/useChatsAndAgents';
 import type { LocalProject } from '@/lib/local-api';
 import { resetProjectsStoreForTests } from '@/hooks/useProjects';
@@ -21,22 +21,33 @@ vi.mock('@/lib/host-tools', () => ({
     ),
 }));
 
-let bridgeStub: ElectronBridge | null = null;
+let bridgeStub: HostBridge | null = null;
 
-vi.mock('@/lib/electron-bridge', () => ({
-  isElectron: () => bridgeStub !== null,
-  getElectronBridge: () => bridgeStub,
+vi.mock('@/lib/host-bridge', () => ({
+  hasHostBridge: () => bridgeStub !== null,
+  getHostBridge: () => bridgeStub,
 }));
 
 const listProjects = vi.fn();
 const openLocalPath = vi.fn();
 
 vi.mock('@/lib/local-api', () => ({
+  LLM_SETTINGS_CHANGED_EVENT: 'steerable:llm-settings-changed',
   listProjects: (...args: unknown[]) => listProjects(...args),
   createProject: vi.fn(),
   updateProject: vi.fn(),
   deleteProject: vi.fn(),
   openLocalPath: (...args: unknown[]) => openLocalPath(...args),
+  getLlmAccount: async () => ({
+    status: 'unsupported',
+    provider: null,
+    label: '',
+    available: null,
+    currency: null,
+    total: null,
+    granted: null,
+    toppedUp: null,
+  }),
 }));
 
 vi.mock('@/brand', () => ({
@@ -125,19 +136,19 @@ describe('AgentSidebar 宿主工具族 chrome', () => {
         captureScreenshot: vi.fn(async () => ({ success: false as const, error: '未实现' })),
       },
       localBackend: {
-        request: vi.fn() as unknown as ElectronBridge['localBackend']['request'],
+        request: vi.fn() as unknown as HostBridge['localBackend']['request'],
         startStream: vi.fn(async () => null),
         cancelStream: vi.fn(),
       },
     };
     renderSidebar();
     await screen.findByText('项目甲');
-    fireEvent.click(screen.getByLabelText('项目菜单'));
+    fireEvent.click(screen.getByLabelText('Project menu'));
     expect(screen.getByTestId('project-overflow-menu')).toBeTruthy();
-    expect(screen.getByTitle('重命名项目')).toBeTruthy();
-    expect(screen.getByTitle('编辑项目')).toBeTruthy();
-    expect(screen.queryByTitle('在访达中显示')).toBeNull();
-    expect(screen.queryByTitle('在文件管理器中显示')).toBeNull();
+    expect(screen.getByTitle('Rename project')).toBeTruthy();
+    expect(screen.getByTitle('Edit project')).toBeTruthy();
+    expect(screen.queryByTitle('Show in Finder')).toBeNull();
+    expect(screen.queryByTitle('Show in file manager')).toBeNull();
     await waitFor(() => expect(openLocalPath).not.toHaveBeenCalled());
   });
 
@@ -159,13 +170,13 @@ describe('AgentSidebar 宿主工具族 chrome', () => {
         captureScreenshot: vi.fn(async () => ({ success: false as const, error: '未实现' })),
       },
       localBackend: {
-        request: vi.fn() as unknown as ElectronBridge['localBackend']['request'],
+        request: vi.fn() as unknown as HostBridge['localBackend']['request'],
         startStream: vi.fn(async () => null),
         cancelStream: vi.fn(),
       },
     };
     renderSidebar();
-    expect(screen.queryByLabelText('新建项目')).toBeNull();
+    expect(screen.queryByLabelText('New project')).toBeNull();
     expect(screen.queryByText('项目甲')).toBeNull();
     expect(listProjects).not.toHaveBeenCalled();
   });

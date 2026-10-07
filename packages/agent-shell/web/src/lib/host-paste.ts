@@ -15,7 +15,7 @@ export interface HostClipboard {
   text: string;
   files: HostClipboardFile[];
 }
-import { getHostBridge } from './electron-bridge';
+import { getHostBridge } from './host-bridge';
 
 let pending = false;
 let lastEditable: HTMLElement | null = null;
@@ -42,10 +42,7 @@ export function requestHostPaste(target?: HTMLElement | null): void {
   const readText = bridge?.readClipboardText;
   if ((!readClipboard && !readText) || pending) return;
   pending = true;
-  const read = readClipboard
-    ? readClipboard()
-    : readText!().then((text) => ({ text, files: [] as HostClipboardFile[] }));
-  void read
+  void readHostClipboard(readClipboard, readText)
     .then((clip) => {
       if (clip.files.length > 0) insertHostFiles(clip.files, target ?? null);
       if (clip.text) insertHostText(clip.text, target ?? null);
@@ -58,6 +55,30 @@ export function requestHostPaste(target?: HTMLElement | null): void {
     });
 }
 
+/**
+ * Prefer the rich pasteboard (text, files, screenshots). Desktop capabilities
+ * may allow only `host_read_clipboard_text`; a denial of the rich command must
+ * still insert plain text.
+ */
+function readHostClipboard(
+  readClipboard: (() => Promise<HostClipboard>) | undefined,
+  readText: (() => Promise<string>) | undefined,
+): Promise<HostClipboard> {
+  const plain = (): Promise<HostClipboard> => {
+    if (!readText) return Promise.reject(new Error('clipboard text is unavailable'));
+    return readText().then((text) => ({ text, files: [] }));
+  };
+  if (!readClipboard) return plain();
+  return Promise.resolve()
+    .then(() => readClipboard())
+    .catch((error: unknown) => {
+      if (!readText) throw error;
+      return plain().catch(() => {
+        throw error;
+      });
+    });
+}
+
 export function hostClipboardAvailable(): boolean {
   const bridge = getHostBridge();
   return (
@@ -67,13 +88,23 @@ export function hostClipboardAvailable(): boolean {
 
 function isEditable(target: EventTarget | null): target is HTMLElement {
   return (
-    target instanceof HTMLInputElement ||
-    target instanceof HTMLTextAreaElement ||
-    (target instanceof HTMLElement && target.isContentEditable)
+    !isTerminalInput(target) &&
+    (target instanceof HTMLInputElement ||
+      target instanceof HTMLTextAreaElement ||
+      (target instanceof HTMLElement && target.isContentEditable))
   );
 }
 
+/**
+ * xterm's hidden textarea. The terminal pastes into its PTY itself; text
+ * written into this textarea never reaches the shell.
+ */
+function isTerminalInput(target: EventTarget | null): boolean {
+  return target instanceof HTMLTextAreaElement && target.closest('.xterm') !== null;
+}
+
 function focusedEditable(): HTMLElement | null {
+  if (isTerminalInput(document.activeElement)) return null;
   if (isEditable(document.activeElement)) return document.activeElement;
   if (lastEditable?.isConnected) return lastEditable;
   return null;

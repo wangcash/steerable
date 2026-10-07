@@ -17,14 +17,6 @@ export interface ProductLinks {
   website?: string;
 }
 
-export interface ProductUpdates {
-  /**
-   * electron-updater generic 通道根地址（目录，不含 latest*.yml）。
-   * 打包配置里的 publishUrl 由产品组装根注入到这里。空则不检查更新。
-   */
-  feedUrl?: string;
-}
-
 export interface ProductConfig {
   /**
    * 云端遥测端点（insights flush 的 API base）。空 = 不上报（中性默认）；
@@ -34,13 +26,8 @@ export interface ProductConfig {
   /** 帮助菜单链接；缺省的项不渲染。 */
   links?: ProductLinks;
   /**
-   * 桌面自动更新。缺省不检查。只在已打包的应用里生效，除非
-   * `DEEPPATH_APP_UPDATE=1`。`DEEPPATH_UPDATE_FEED_URL` 可覆盖 feedUrl。
-   */
-  updates?: ProductUpdates;
-  /**
-   * BS 模式的 userData 目录名（~/ 下）。CS 模式由 Electron 按
-   * productName 分目录，不经此字段。
+   * 未设置 `DEEPPATH_USER_DATA_DIR` 时的 userData 目录名（~/ 下）。
+   * Tauri 宿主总是注入该环境变量，不经此字段。
    */
   dataDirName?: string;
   /**
@@ -129,6 +116,14 @@ export interface ProductConfig {
    * STEERABLE_ORCHESTRATION 环境变量（'1' 开启，'0' 显式关闭）优先级更高。
    */
   orchestration?: boolean | { enabled?: boolean; maxDepth?: number; maxParallel?: number };
+  /**
+   * 界面语言。缺省只有 `en`。译文在应用层语言包，不在本包。
+   * `locales` 是这个产品装进包里的语言；多于一种时设置页才出现切换。
+   */
+  i18n?: {
+    locales: string[];
+    defaultLocale: string;
+  };
 }
 
 /** shell 内置智能体：只有产品显式 `true` 才开。 */

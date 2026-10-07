@@ -1,6 +1,6 @@
 /**
  * BS 模式的宿主 bridge：与 Electron preload（src/preload.ts）暴露的
- * `window.electron` 同一接口（ElectronBridge），但传输换成 HTTP + SSE：
+ * `window.steerableHost` 同一接口（HostBridge），但传输换成 HTTP + SSE：
  *
  *   localBackend.request   → fetch /api/v2/*
  *   localBackend.startStream → fetch（ReadableStream 逐 chunk 喂 onEvent）
@@ -12,17 +12,18 @@
  * onPackEvent（= subscribeChannel）订阅。
  *
  * server 在 index.html 里注入 `window.__DEEPPATH_BS__`（platform/brand），
- * getElectronBridge() 据此在浏览器里选中本实现。
+ * getHostBridge() 据此在浏览器里选中本实现。
  */
 import type {
   ApprovalPromptRequest,
   AskUserPromptRequest,
-  ElectronBridge,
+  HostBridge,
   LocalBackendRequestInput,
   LocalBackendStreamEvent,
   TerminalSession,
   TerminalSpawnOptions,
-} from './electron-bridge';
+} from './host-bridge';
+import { t } from '@/i18n';
 
 interface BsBootstrap {
   platform: NodeJS.Platform;
@@ -118,10 +119,18 @@ function subscribeChannel<T>(channel: string, callback: (payload: T) => void): (
 }
 
 // ---------------------------------------------------------------------------
-// 流式聊天：fetch + ReadableStream。取消 = AbortController（server 端
-// req close → abort agent 循环，对齐 Electron cancelStream 语义）。
+// 流式聊天：fetch + ReadableStream。聊天流通过显式 cancel 端点停止，原
+// response 在服务端完成取消和落库后自然结束；其他流回退 AbortController。
 // ---------------------------------------------------------------------------
-const activeStreams = new Map<string, AbortController>();
+const activeStreams = new Map<
+  string,
+  { controller: AbortController; cancelPath: string | null; cancelling: boolean }
+>();
+
+function chatCancelPath(path: string): string | null {
+  const match = path.match(/^(\/api\/v2\/chats\/[^/]+)\/(?:send|run|agent)$/);
+  return match ? `${match[1]}/cancel` : null;
+}
 
 async function startStream(
   input: LocalBackendRequestInput,
@@ -145,7 +154,11 @@ async function startStream(
     onEvent({ type: 'error', error: `start stream failed (${res.status})` });
     return null;
   }
-  activeStreams.set(streamId, controller);
+  activeStreams.set(streamId, {
+    controller,
+    cancelPath: chatCancelPath(input.path),
+    cancelling: false,
+  });
   void (async () => {
     const reader = res.body!.getReader();
     const decoder = new TextDecoder();
@@ -171,8 +184,16 @@ async function startStream(
 }
 
 function cancelStream(streamId: string): void {
-  activeStreams.get(streamId)?.abort();
-  activeStreams.delete(streamId);
+  const active = activeStreams.get(streamId);
+  if (!active || active.cancelling) return;
+  active.cancelling = true;
+  if (!active.cancelPath) {
+    active.controller.abort();
+    return;
+  }
+  void http('POST', active.cancelPath, {}).catch(() => {
+    active.controller.abort();
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -197,9 +218,9 @@ async function terminalEnsure(options?: TerminalSpawnOptions): Promise<TerminalS
   return session;
 }
 
-export function createHttpBridge(): ElectronBridge {
+export function createHttpBridge(): HostBridge {
   const boot = bootstrap();
-  const bridge: ElectronBridge = {
+  const bridge: HostBridge = {
     runtime: 'local',
     platform: boot.platform,
 
@@ -225,7 +246,9 @@ export function createHttpBridge(): ElectronBridge {
       },
       captureScreenshot: async () => ({
         success: false as const,
-        error: '浏览器模式不支持窗口截图，请用系统截图工具。',
+        error: t(
+          'Browser mode cannot capture window screenshots. Use your system screenshot tool.',
+        ),
       }),
     },
 
@@ -262,6 +285,8 @@ export function createHttpBridge(): ElectronBridge {
 
     onChatCreated: (callback) =>
       subscribeChannel<{ chatId: string; agentId?: string | null }>('chat-created', callback),
+
+    onStoreChanged: (callback) => subscribeChannel('store:changed', () => callback()),
 
     onTaskUpdated: (callback) =>
       subscribeChannel<{ chatId: string; taskId: string }>(
@@ -318,9 +343,9 @@ export function createHttpBridge(): ElectronBridge {
   return bridge;
 }
 
-let singleton: ElectronBridge | null = null;
+let singleton: HostBridge | null = null;
 
-export function getHttpBridge(): ElectronBridge {
+export function getHttpBridge(): HostBridge {
   if (!singleton) singleton = createHttpBridge();
   return singleton;
 }

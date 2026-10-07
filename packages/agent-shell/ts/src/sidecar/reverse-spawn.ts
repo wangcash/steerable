@@ -20,7 +20,7 @@ import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
-import log from 'electron-log';
+import { log } from '../log.js';
 import type { SidecarReverseHandler } from './types.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -41,11 +41,6 @@ interface SpawnParams {
   policy?: SpawnPolicy;
 }
 
-type ElectronProcess = NodeJS.Process & {
-  resourcesPath?: string;
-  defaultApp?: boolean;
-};
-
 export function resolveWinSpawnHelperPath(): string | null {
   const binary = 'win-spawn-helper.exe';
   // 显式覆盖（测试/调试逃生门）：设置后只认这一条路径。指向不存在的
@@ -56,21 +51,12 @@ export function resolveWinSpawnHelperPath(): string | null {
   if (override !== undefined) {
     return override && existsSync(override) ? override : null;
   }
-  const electron = process as ElectronProcess;
-  const resourcesPath = electron.resourcesPath;
-  const candidates: string[] = [];
-  if (resourcesPath) {
-    candidates.push(join(resourcesPath, 'win-spawn-helper', binary));
-  }
-  // Packaged extraResources live under resourcesPath. cwd is the user's
-  // launch directory and must not supply the confinement binary.
-  // `electron .` sets defaultApp and does not copy extraResources there;
-  // npm-published shell also cannot see the host checkout via __dirname.
-  const packagedElectron = Boolean(resourcesPath) && electron.defaultApp !== true;
-  if (!packagedElectron) {
-    candidates.push(join(process.cwd(), 'resources', 'windows-spawn-helper', binary));
-    candidates.push(join(__dirname, '..', '..', 'resources', 'windows-spawn-helper', binary));
-  }
+  // Packaged desktop hosts pass the bundled helper through the override.
+  // npm-published shell cannot see the host checkout via __dirname.
+  const candidates = [
+    join(process.cwd(), 'resources', 'windows-spawn-helper', binary),
+    join(__dirname, '..', '..', 'resources', 'windows-spawn-helper', binary),
+  ];
   for (const candidate of candidates) {
     if (existsSync(candidate)) return candidate;
   }
@@ -130,8 +116,11 @@ function runHelper(
 }> {
   return new Promise((resolve, reject) => {
     const child = spawn(helperPath, [], {
-      stdio: ['pipe', 'pipe', 'inherit'],
+      stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
+    });
+    createInterface({ input: child.stderr }).on('line', (line) => {
+      if (line.trim()) log.warn('[host-spawn] helper', line);
     });
     let stdout = '';
     let stderr = '';

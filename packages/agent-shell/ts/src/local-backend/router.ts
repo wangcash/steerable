@@ -3,7 +3,12 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import os from 'node:os';
-import { getAppRootDir, shellOpenPath } from '../runtime.js';
+import { getAppRootDir, getUserDataDir, shellOpenPath } from '../runtime.js';
+import {
+  acquireChatWriteLock,
+  ChatBusyError,
+} from '../storage/process-locks.js';
+import type { HeldWriteLease } from '../storage/write-lease.js';
 import { llmService, getSidecarSupervisor, whenSidecarSupervisor } from '../llm/index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -20,6 +25,11 @@ import {
   driveWithAutoContinue,
   resolveAutoContinueMax,
 } from './auto-continue-helper.js';
+import {
+  buildActiveGoalContext,
+  buildGoalContinuationPrompt,
+  shouldContinueGoal,
+} from './goal-continuation-helper.js';
 import {
   buildAmbientDelegateRoster,
   buildDelegateDispatchInstruction,
@@ -74,6 +84,7 @@ import {
 } from '../host-tools-runtime.js';
 import { SidecarSupervisor } from '../sidecar/index.js';
 import { diagnoseLlmConnection } from './llm-diagnose.js';
+import { readLlmAccount } from './llm-account.js';
 import {
   brandSkillVars,
   buildSystemPrompt,
@@ -112,6 +123,7 @@ import {
 } from '../project-home.js';
 import type { TaskService } from './task-service.js';
 import { registerLiveStream, getLiveStream, removeLiveStream } from './live-stream.js';
+import { compactHistory, forkHistory, rewindFrom, type StoredTurn } from './history-edit.js';
 import {
   beginPackTurnObservers,
   collectPackExecWritableRoots,
@@ -119,6 +131,8 @@ import {
   collectPackWorldState,
 } from './pack-turn-hooks.js';
 import { matchPackBackendRoute } from './pack-backend-routes.js';
+import { invokePackHttpRoute } from '../host/http-routes.js';
+import { installProductCli } from '../cli-install.js';
 import { collectTurnFiles } from './turn-files.js';
 import { resolveMentionedPaths } from './mentioned-paths.js';
 import { getAuthProvider, type Principal } from '../auth/index.js';
@@ -153,6 +167,17 @@ function parseSourceFolders(value: unknown): string[] {
     .map(expandUserPath);
 }
 
+/** 拖拽排序的 id 列表。不是字符串数组时返回 null，由路由回 400。 */
+function readProjectOrderIds(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  const ids: string[] = [];
+  for (const item of value) {
+    if (typeof item !== 'string' || item.trim() === '') return null;
+    ids.push(item.trim());
+  }
+  return ids;
+}
+
 /**
  * 流式响应中每条 SSE chunk 的 emit 回调。
  * router 在生成过程中每收到一个新片段就立刻调用一次，
@@ -162,6 +187,19 @@ export type StreamEmit = (sseChunk: string) => void;
 
 export interface StreamResult {
   status: number;
+  /** Internal turn outcome used by automatic goal continuation. */
+  turn?: {
+    completionStatus: string;
+    madeProgress: boolean;
+  };
+}
+
+export type ChatWakeTrigger = 'goal' | 'loop';
+
+export interface WakeResult {
+  started: boolean;
+  reason?: 'busy' | 'failed';
+  status?: number;
 }
 
 /**
@@ -278,7 +316,7 @@ function buildLocalAgent() {
     platform: process.platform,
     hostname: 'localhost',
     shell: process.platform === 'win32' ? 'powershell' : 'zsh',
-    osVersion: process.versions.electron || null,
+    osVersion: null,
     osArch: process.arch,
     isOnline: true,
     lastHeartbeat: now,
@@ -362,6 +400,12 @@ export class LocalBackendRouter {
     this.resolveStore = options.resolveStore ?? (() => options.store);
     this.broadcast = options.broadcast ?? null;
     this.taskService = options.taskService ?? null;
+    const goals = (this.toolRouter as ToolRouter & {
+      goals?: () => { onChange(listener: (chatId: string, goal: unknown) => void): () => void };
+    }).goals?.();
+    goals?.onChange((chatId, goal) => {
+      this.broadcast?.('goal-changed', { chatId, goal });
+    });
   }
 
   private get store(): ScopedStore {
@@ -384,6 +428,78 @@ export class LocalBackendRouter {
     const { method } = request;
     const url = new URL(request.path, 'http://local.backend');
     const pathname = url.pathname;
+
+    const goalMatch = pathname.match(/^\/api\/v2\/chats\/([^/]+)\/goal$/);
+    if (goalMatch) {
+      const chatId = goalMatch[1];
+      const chat = await this.store.getChat(chatId);
+      if (!chat) return { status: 404, data: { detail: 'chat not found' } };
+      const goals = this.toolRouter.goals();
+      if (method === 'GET') {
+        const result = await goals.get(chatId);
+        return { status: 200, data: { goal: result.goal ?? null } };
+      }
+      if (method === 'POST') {
+        const payload = this.toRecord(request.body);
+        const action = String(payload.action || '');
+        if (action === 'set') {
+          const result = await goals.create(chatId, String(payload.objective || ''));
+          if (result.success && result.goal) {
+            this.startGoalWake(chatId, result.goal);
+          }
+          return {
+            status: result.success ? 200 : 409,
+            data: result.success ? { goal: result.goal } : { detail: result.error, goal: result.goal },
+          };
+        }
+        if (action === 'clear') {
+          const result = await goals.clear(chatId);
+          return { status: 200, data: { goal: result.goal ?? null } };
+        }
+        const current = (await goals.get(chatId)).goal;
+        if (!current) return { status: 404, data: { detail: 'goal not found' } };
+        const result = await goals.update({
+          chatId,
+          id: current.id,
+          revision: current.revision,
+          action,
+          actor: 'user',
+          objective: typeof payload.objective === 'string' ? payload.objective : undefined,
+        });
+        if (result.success && result.goal && action === 'resume') {
+          this.startGoalWake(chatId, result.goal);
+        }
+        return {
+          status: result.success ? 200 : 400,
+          data: result.success ? { goal: result.goal } : { detail: result.error, goal: result.goal },
+        };
+      }
+      return this.notFound('Not found');
+    }
+
+    const loopsMatch = pathname.match(/^\/api\/v2\/chats\/([^/]+)\/loops$/);
+    if (loopsMatch && method === 'GET') {
+      const chatId = loopsMatch[1];
+      if (!await this.store.getChat(chatId)) {
+        return { status: 404, data: { detail: 'chat not found' } };
+      }
+      return {
+        status: 200,
+        data: { loops: this.toolRouter.listMonitoredLoops(chatId) },
+      };
+    }
+    const loopMatch = pathname.match(/^\/api\/v2\/chats\/([^/]+)\/loops\/([^/]+)$/);
+    if (loopMatch && method === 'DELETE') {
+      const chatId = loopMatch[1];
+      if (!await this.store.getChat(chatId)) {
+        return { status: 404, data: { detail: 'chat not found' } };
+      }
+      const success = this.toolRouter.stopMonitoredLoop(chatId, loopMatch[2]);
+      return {
+        status: success ? 200 : 404,
+        data: success ? { success: true } : { detail: 'loop not found' },
+      };
+    }
 
     if (method === 'GET' && pathname === '/api/v2/auth/me') {
       const authProvider = getAuthProvider();
@@ -643,7 +759,7 @@ export class LocalBackendRouter {
     }
 
     // ───── 项目模式：projects CRUD ─────
-    // 项目记录存 electron-store（agent-projects.json），chat.project_id 存
+    // 项目记录存 json-store（agent-projects.json），chat.project_id 存
     // SQLite。删除项目不删会话——会话降级为无项目对话。
     if (
       (pathname === '/api/v2/projects' || pathname.startsWith('/api/v2/projects/')) &&
@@ -683,6 +799,21 @@ export class LocalBackendRouter {
           };
         }
       }
+    }
+
+    if (pathname === '/api/v2/projects/order' && method === 'PUT') {
+      const registry = this.toolRouter.projectRegistry;
+      if (!registry) {
+        return { status: 503, data: { error: '项目注册表不可用' } };
+      }
+      const orderedIds = readProjectOrderIds(this.toRecord(request.body).orderedIds);
+      if (!orderedIds) {
+        return { status: 400, data: { error: 'orderedIds 必须是项目 id 列表' } };
+      }
+      return {
+        status: 200,
+        data: { success: true, projects: registry.reorder(orderedIds) },
+      };
     }
 
     const projectMatch = pathname.match(/^\/api\/v2\/projects\/([^/]+)$/);
@@ -862,23 +993,29 @@ export class LocalBackendRouter {
         };
       }
       if (method === 'DELETE') {
-        if (url.searchParams.get('onlyIfEmpty') === '1') {
-          const deleted = await this.store.deleteChatIfEmpty(chatId);
+        const lease = this.tryChatLock(chatId);
+        if (!lease) return this.chatBusy();
+        try {
+          if (url.searchParams.get('onlyIfEmpty') === '1') {
+            const deleted = await this.store.deleteChatIfEmpty(chatId);
+            return {
+              status: 200,
+              data: { success: true, deleted, chatId },
+            };
+          }
+          const ok = await this.store.deleteChat(chatId);
+          if (!ok) return this.notFound('Chat not found');
           return {
             status: 200,
-            data: { success: true, deleted, chatId },
+            data: {
+              success: true,
+              message: '删除成功',
+              chatId,
+            },
           };
+        } finally {
+          lease.release();
         }
-        const ok = await this.store.deleteChat(chatId);
-        if (!ok) return this.notFound('Chat not found');
-        return {
-          status: 200,
-          data: {
-            success: true,
-            message: '删除成功',
-            chatId,
-          },
-        };
       }
     }
 
@@ -886,7 +1023,14 @@ export class LocalBackendRouter {
     if (chatPinMatch && method === 'PUT') {
       const chatId = chatPinMatch[1];
       const payload = this.toRecord(request.body);
-      const updated = await this.store.updateChat(chatId, { isPinned: Boolean(payload.isPinned) });
+      const lease = this.tryChatLock(chatId);
+      if (!lease) return this.chatBusy();
+      let updated;
+      try {
+        updated = await this.store.updateChat(chatId, { isPinned: Boolean(payload.isPinned) });
+      } finally {
+        lease.release();
+      }
       if (!updated) return this.notFound('Chat not found');
       return {
         status: 200,
@@ -922,12 +1066,19 @@ export class LocalBackendRouter {
           return this.badRequest('projectId 必须是项目 id 字符串或 null');
         }
       }
-      const updated = await this.store.updateChat(chatId, {
-        title: typeof payload.title === 'string' ? payload.title : undefined,
-        systemPrompt: typeof payload.systemPrompt === 'string' ? payload.systemPrompt : undefined,
-        pinnedRefs: Array.isArray(payload.pinnedRefs) ? payload.pinnedRefs : undefined,
-        projectId: projectIdUpdate,
-      });
+      const lease = this.tryChatLock(chatId);
+      if (!lease) return this.chatBusy();
+      let updated;
+      try {
+        updated = await this.store.updateChat(chatId, {
+          title: typeof payload.title === 'string' ? payload.title : undefined,
+          systemPrompt: typeof payload.systemPrompt === 'string' ? payload.systemPrompt : undefined,
+          pinnedRefs: Array.isArray(payload.pinnedRefs) ? payload.pinnedRefs : undefined,
+          projectId: projectIdUpdate,
+        });
+      } finally {
+        lease.release();
+      }
       if (!updated) return this.notFound('Chat not found');
       return {
         status: 200,
@@ -1026,6 +1177,43 @@ export class LocalBackendRouter {
       }
       await supervisor.cancelChat(streamId);
       return { status: 200, data: { success: true } };
+    }
+
+    const compactMatch = pathname.match(/^\/api\/v2\/chats\/([^/]+)\/compact$/);
+    if (compactMatch && method === 'POST') {
+      const chatId = compactMatch[1];
+      const chat = await this.store.getChat(chatId);
+      if (!chat) return { status: 404, data: { detail: 'chat not found' } };
+      const plan = compactHistory(await this.historyTurns(chatId));
+      if (!plan) return { status: 200, data: { compacted: 0 } };
+      await this.store.deleteMessagesFrom(chatId, plan.deleteFromId);
+      for (const write of plan.writes) {
+        await this.store.addMessage(chatId, write.role, write.content, write.messageMetadata);
+      }
+      return { status: 200, data: { compacted: plan.compacted } };
+    }
+
+    const forkMatch = pathname.match(/^\/api\/v2\/chats\/([^/]+)\/fork$/);
+    if (forkMatch && method === 'POST') {
+      const chatId = forkMatch[1];
+      const chat = await this.store.getChat(chatId);
+      if (!chat) return { status: 404, data: { detail: 'chat not found' } };
+      const created = await this.store.createChat(chat.title || '分叉', chat.agentId, chat.projectId);
+      for (const write of forkHistory(await this.historyTurns(chatId))) {
+        await this.store.addMessage(created.id, write.role, write.content, write.messageMetadata);
+      }
+      return { status: 200, data: { chatId: created.id } };
+    }
+
+    const rewindMatch = pathname.match(/^\/api\/v2\/chats\/([^/]+)\/rewind$/);
+    if (rewindMatch && method === 'POST') {
+      const chatId = rewindMatch[1];
+      const chat = await this.store.getChat(chatId);
+      if (!chat) return { status: 404, data: { detail: 'chat not found' } };
+      const cut = rewindFrom(await this.historyTurns(chatId));
+      if (!cut) return { status: 200, data: { removed: 0 } };
+      const removed = await this.store.deleteMessagesFrom(chatId, cut.deleteFromId);
+      return { status: 200, data: { removed } };
     }
 
     if (method === 'GET' && pathname === '/api/v2/chat-agents') {
@@ -1700,6 +1888,19 @@ export class LocalBackendRouter {
     // W-llm-diagnose：LLM 链路诊断。设置页「诊断」按钮触发，在主进程内
     // 探测 DNS/TCP/TLS/HTTP/chat 五级连通性，并报告宿主机的 ambient 代理
     // 配置（sidecar 沙箱视角会隐藏用户需要看到的代理问题）。
+    if (method === 'POST' && pathname === '/api/v2/cli/install') {
+      const payload = this.toRecord(request.body);
+      const name = typeof payload.name === 'string' ? payload.name : '';
+      try {
+        return { status: 200, data: installProductCli(name) };
+      } catch (error) {
+        return {
+          status: 400,
+          data: { error: error instanceof Error ? error.message : String(error) },
+        };
+      }
+    }
+
     if (method === 'POST' && pathname === '/api/v2/llm/diagnose') {
       const payload = this.toRecord(request.body);
       const settings = llmService.getSettings();
@@ -1748,6 +1949,14 @@ export class LocalBackendRouter {
         return { status: 503, data: { error: 'sidecar 未就绪', posture: null, egress } };
       }
       return { status: 200, data: { posture: supervisor.getSandboxPosture(), egress } };
+    }
+
+    if (method === 'GET' && pathname === '/api/v2/llm/account') {
+      const settings = resolveRuntimeLlmSettings(await this.store.getLlmSettings());
+      const account = await readLlmAccount(settings, {
+        refresh: url.searchParams.get('refresh') === '1',
+      });
+      return { status: 200, data: account };
     }
 
     if (pathname === '/api/v2/local-settings/llm') {
@@ -2086,7 +2295,26 @@ export class LocalBackendRouter {
       });
     }
 
+    const packHttp = await invokePackHttpRoute(method, pathname, request.body);
+    if (packHttp) return packHttp;
+
     return this.fallbackResponse(method, pathname);
+  }
+
+  private startGoalWake(
+    chatId: string,
+    goal: { id: string; objective: string; turns: number },
+  ): void {
+    void this.wakeChat(chatId, {
+      trigger: 'goal',
+      message: buildGoalContinuationPrompt(goal),
+      sourceId: goal.id,
+    }).catch((error: unknown) => {
+      console.warn('[goal] chat wake failed', {
+        chatId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
   }
 
   /**
@@ -2144,8 +2372,92 @@ export class LocalBackendRouter {
   ): Promise<StreamResult> {
     return this.storeContext.run(
       this.resolveStore(request.principal),
-      () => this.handleStreamScoped(request, emit, options),
+      async () => {
+        const result = await this.handleStreamScoped(request, emit, options);
+        await this.continueActiveGoal(request, result, options);
+        return result;
+      },
     );
+  }
+
+  /**
+   * Start one host-initiated turn in an idle chat, then continue an active
+   * goal if that turn still leaves work to do.
+   */
+  async wakeChat(
+    chatId: string,
+    input: {
+      trigger: ChatWakeTrigger;
+      message: string;
+      sourceId: string;
+    },
+  ): Promise<WakeResult> {
+    return this.storeContext.run(this.store, async () => {
+      this.broadcast?.('chat-turn-started', {
+        chatId,
+        trigger: input.trigger,
+        sourceId: input.sourceId,
+      });
+      const result = await this.handleStreamScoped(
+        {
+          method: 'POST',
+          path: `/api/v2/chats/${encodeURIComponent(chatId)}/send`,
+          body: {
+            message: input.message,
+            internal: true,
+            trigger: input.trigger,
+            sourceId: input.sourceId,
+          },
+        },
+        () => {},
+      );
+      this.broadcast?.('chat-turn-finished', {
+        chatId,
+        trigger: input.trigger,
+        sourceId: input.sourceId,
+        status: result.turn?.completionStatus ?? result.status,
+      });
+      if (result.status === 409) return { started: false, reason: 'busy', status: result.status };
+      if (result.status !== 200) return { started: false, reason: 'failed', status: result.status };
+      await this.continueActiveGoal(
+        {
+          method: 'POST',
+          path: `/api/v2/chats/${encodeURIComponent(chatId)}/send`,
+          body: { internal: true, trigger: input.trigger, sourceId: input.sourceId },
+        },
+        result,
+        {},
+      );
+      return { started: true, status: result.status };
+    });
+  }
+
+  private async continueActiveGoal(
+    request: LocalBackendRequest,
+    result: StreamResult,
+    options: StreamOptions,
+  ): Promise<void> {
+    if (!result.turn) return;
+    const pathname = new URL(request.path, 'http://local.backend').pathname;
+    const match = pathname.match(/^\/api\/v2\/chats\/([^/]+)\/(?:send|run|agent)$/);
+    if (!match) return;
+    const chatId = decodeURIComponent(match[1]);
+    const goals = this.toolRouter.goals();
+    const current = (await goals.get(chatId)).goal;
+    if (!current) return;
+    const recorded = await goals.recordTurn(chatId, current.id);
+    if (!recorded) return;
+    if (!shouldContinueGoal({
+      phase: recorded.phase,
+      completionStatus: result.turn.completionStatus,
+      madeProgress: result.turn.madeProgress,
+      aborted: options.signal?.aborted === true,
+    })) return;
+    await this.wakeChat(chatId, {
+      trigger: 'goal',
+      message: buildGoalContinuationPrompt(recorded),
+      sourceId: recorded.id,
+    });
   }
 
   private async handleStreamScoped(
@@ -2202,6 +2514,7 @@ export class LocalBackendRouter {
       return { status: 404 };
     }
 
+    return this.withChatWriteLock(chatId, emit, async (emit) => {
     // W7-1: resume=true（仅 send 路由）续跑 durable record 里被中断的 turn，
     // 不追加新用户消息；与 regenerate 互斥（regenerate 有自己的路径参数语义）。
     const isResume = !regenerateMatch && payload.resume === true;
@@ -2348,8 +2661,22 @@ export class LocalBackendRouter {
       chatAgents,
     );
     if (!regenerateMatch && !isResume) {
-      const userMeta = mentionedAgentIds.length > 0
-        ? JSON.stringify({ mentionedAgentIds })
+      const internal =
+        payload.internal === true &&
+        (payload.trigger === 'goal' || payload.trigger === 'loop') &&
+        typeof payload.sourceId === 'string';
+      const userMetadata = {
+        ...(mentionedAgentIds.length > 0 ? { mentionedAgentIds } : {}),
+        ...(internal
+          ? {
+              internal: true,
+              trigger: payload.trigger,
+              sourceId: payload.sourceId,
+            }
+          : {}),
+      };
+      const userMeta = Object.keys(userMetadata).length > 0
+        ? JSON.stringify(userMetadata)
         : null;
       const userMessage = await this.store.addMessage(chatId, 'user', userMessageText, userMeta);
       currentUserMessageId = userMessage.id;
@@ -2471,6 +2798,7 @@ export class LocalBackendRouter {
         Object.fromEntries(ambientRoster.map((row) => [row.profileName, row.profile])),
       ),
       parentAgentId: turnAgents.parent?.id ?? null,
+    });
     });
   }
 
@@ -2726,10 +3054,15 @@ export class LocalBackendRouter {
     const runtimeEnvironment = this.buildRuntimeEnvironmentContext(chatMode);
     // 名录进 realityCheck：两条系统提示拼装路径（技能拼装 / 用户整段覆盖）
     // 都会带上它，且位置在末尾——不动技能正文那段 prompt cache 前缀。
+    const activeGoal = (await this.toolRouter.goals().get(chatId)).goal;
+    const goalContext = activeGoal?.phase === 'active'
+      ? buildActiveGoalContext(activeGoal.objective)
+      : '';
     const realityCheck =
       runtimeEnvironment +
       this.buildToolRealityCheck(turnTools, polluted, chatMode) +
-      buildDelegateRosterHint([...delegates.mention, ...delegates.ambient]);
+      buildDelegateRosterHint([...delegates.mention, ...delegates.ambient]) +
+      goalContext;
 
     // 用户显式覆盖（payload.systemPrompt 优先 / settings.systemPrompt 自定义了且非默认值次之）走
     // "整段替换"路径，保持旧行为可被外部完全控制；否则交给 skill-based
@@ -3341,6 +3674,49 @@ export class LocalBackendRouter {
     return String(value);
   }
 
+  private chatBusy(): { status: 409; data: { code: 'chat_busy'; message: string } } {
+    return {
+      status: 409,
+      data: { code: 'chat_busy', message: '该会话正在另一个进程中运行' },
+    };
+  }
+
+  private tryChatLock(chatId: string): HeldWriteLease | null {
+    try {
+      return acquireChatWriteLock(getUserDataDir(), chatId);
+    } catch (error) {
+      if (error instanceof ChatBusyError) return null;
+      throw error;
+    }
+  }
+
+  private async withChatWriteLock(
+    chatId: string,
+    emit: StreamEmit,
+    body: (emit: StreamEmit) => Promise<StreamResult>,
+  ): Promise<StreamResult> {
+    const lease = this.tryChatLock(chatId);
+    if (!lease) {
+      emit(this.sse('error', { code: 'chat_busy', message: '该会话正在另一个进程中运行' }));
+      return { status: 409 };
+    }
+    let doneChunk: string | undefined;
+    let result: StreamResult;
+    try {
+      result = await body((chunk) => {
+        if (chunk === 'data: [DONE]\n\n') {
+          doneChunk = chunk;
+          return;
+        }
+        emit(chunk);
+      });
+    } finally {
+      lease.release();
+    }
+    if (doneChunk) emit(doneChunk);
+    return result;
+  }
+
   private sse(event: string, data: unknown): string {
     return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   }
@@ -3751,6 +4127,7 @@ export class LocalBackendRouter {
         sinceMs: turnStartedAtMs,
         actions: executedActions,
         projectRoot: workspaceRoot,
+        finalText: assistantText,
       });
     } catch (turnFilesErr) {
       console.warn('[local-backend] collect turn files failed', turnFilesErr);
@@ -3865,7 +4242,13 @@ export class LocalBackendRouter {
       assistantText,
       completionStatus,
     });
-    return { status: 200 };
+    return {
+      status: 200,
+      turn: {
+        completionStatus,
+        madeProgress: executedActions.length > 0 || assistantText.length > 0,
+      },
+    };
   }
 
   /**
@@ -3916,6 +4299,16 @@ export class LocalBackendRouter {
    */
   private sseData(data: unknown): string {
     return `data: ${JSON.stringify(data)}\n\n`;
+  }
+
+  private async historyTurns(chatId: string): Promise<StoredTurn[]> {
+    const messages = await this.store.listMessages(chatId);
+    return messages.map((message) => ({
+      id: message.id,
+      role: message.role,
+      content: message.content,
+      messageMetadata: message.messageMetadata,
+    }));
   }
 
   private toRecord(body: unknown): Record<string, unknown> {

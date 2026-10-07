@@ -9,7 +9,8 @@
  *   - 右侧面板：终端按钮快捷键提示随平台变化，包槽位渲染分段控件；
  *   - 副作用：进入会话路由同步 selectedAgentId、菜单 Cmd+N / Cmd+T 订阅与
  *     退订、滚动接近底部自动加载下一页；
- *   - 项目模式（Electron）：项目分组与折叠、孤儿会话回落日期分组、
+ *   - 项目模式（Electron）：项目分组与折叠、拖拽组头排序、孤儿会话回落日期分组、
+ *     项目内超过 5 条先收起，每次再展开 5 条；
  *     新建（弹窗填名称 + 可选源文件夹）；组头 hover 为 ✎ 新建对话 / ·· 菜单
  *     （重命名 / 编辑项目多源文件夹 / 访达或文件管理器 / 弹窗确认删除）。
  * 智能体挑选列表已迁到 ChatInput（见组件头注释），侧栏只剩同步副作用可测。
@@ -17,37 +18,50 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Outlet, Route, Routes, useLocation } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { ElectronBridge } from '@/lib/electron-bridge';
+import type { HostBridge } from '@/lib/host-bridge';
 import type { UseChatsAndAgentsResult } from '@/hooks/useChatsAndAgents';
 import type { LocalChat, LocalChatAgent, LocalProject } from '@/lib/local-api';
 import type { RightPanelState } from '@/layouts/AgentLayout';
 import { resetProjectsStoreForTests } from '@/hooks/useProjects';
 
-// 可控桥桩：bridgeStub 为 null 时 isElectron() = false（纯浏览器预览路径），
+// 可控桥桩：bridgeStub 为 null 时 hasHostBridge() = false（纯浏览器预览路径），
 // 项目模式用例经 enterElectron() 装上带 selectDirectory 的桥。
-let bridgeStub: ElectronBridge | null = null;
+let bridgeStub: HostBridge | null = null;
 
-vi.mock('@/lib/electron-bridge', () => ({
-  isElectron: () => bridgeStub !== null,
-  getElectronBridge: () => bridgeStub,
+vi.mock('@/lib/host-bridge', () => ({
+  hasHostBridge: () => bridgeStub !== null,
+  getHostBridge: () => bridgeStub,
 }));
 
 const listProjects = vi.fn();
 const createProject = vi.fn();
 const updateProject = vi.fn();
+const reorderProjects = vi.fn();
 const deleteProject = vi.fn();
 const openLocalPath = vi.fn();
 const setChatPinned = vi.fn();
 const getChatLiveStream = vi.fn();
 
 vi.mock('@/lib/local-api', () => ({
+  LLM_SETTINGS_CHANGED_EVENT: 'steerable:llm-settings-changed',
   listProjects: (...args: unknown[]) => listProjects(...args),
   createProject: (...args: unknown[]) => createProject(...args),
   updateProject: (...args: unknown[]) => updateProject(...args),
+  reorderProjects: (...args: unknown[]) => reorderProjects(...args),
   deleteProject: (...args: unknown[]) => deleteProject(...args),
   openLocalPath: (...args: unknown[]) => openLocalPath(...args),
   setChatPinned: (...args: unknown[]) => setChatPinned(...args),
   getChatLiveStream: (chatId: string) => getChatLiveStream(chatId),
+  getLlmAccount: async () => ({
+    status: 'unsupported',
+    provider: null,
+    label: '',
+    available: null,
+    currency: null,
+    total: null,
+    granted: null,
+    toppedUp: null,
+  }),
 }));
 
 vi.mock('@/brand', () => ({
@@ -69,6 +83,7 @@ beforeEach(() => {
   listProjects.mockReset();
   createProject.mockReset();
   updateProject.mockReset();
+  reorderProjects.mockReset();
   deleteProject.mockReset();
   openLocalPath.mockReset();
   setChatPinned.mockReset();
@@ -156,7 +171,7 @@ function setPlatform(platform: string) {
   Object.defineProperty(window.navigator, 'platform', { value: platform, configurable: true });
 }
 
-function baseElectronBridge(overrides: Partial<ElectronBridge> = {}): ElectronBridge {
+function baseHostBridge(overrides: Partial<HostBridge> = {}): HostBridge {
   return {
     runtime: 'local',
     platform: 'darwin',
@@ -166,7 +181,7 @@ function baseElectronBridge(overrides: Partial<ElectronBridge> = {}): ElectronBr
     },
     localBackend: {
       // 侧栏用例不对 request 做断言；vi.fn 保不住泛型签名，这里按接口收窄。
-      request: vi.fn() as unknown as ElectronBridge['localBackend']['request'],
+      request: vi.fn() as unknown as HostBridge['localBackend']['request'],
       startStream: vi.fn(async () => null),
       cancelStream: vi.fn(),
     },
@@ -178,7 +193,7 @@ function baseElectronBridge(overrides: Partial<ElectronBridge> = {}): ElectronBr
 function enterElectron(projects: LocalProject[]) {
   listProjects.mockResolvedValue({ projects });
   const selectDirectory = vi.fn(async () => ({ canceled: true, filePaths: [] as string[] }));
-  bridgeStub = baseElectronBridge();
+  bridgeStub = baseHostBridge();
   bridgeStub.local!.selectDirectory = selectDirectory;
   return { selectDirectory };
 }
@@ -259,8 +274,73 @@ function renderSidebar(
 }
 
 function openProjectMenu() {
-  fireEvent.click(screen.getByLabelText('项目菜单'));
+  fireEvent.click(screen.getByLabelText('Project menu'));
   expect(screen.getByTestId('project-overflow-menu')).toBeTruthy();
+}
+
+function projectIds(): string[] {
+  return screen.getAllByTestId('sidebar-project').map((el) => el.getAttribute('data-project-id') ?? '');
+}
+
+function projectHandle(projectId: string): HTMLElement {
+  const handle = document.querySelector(
+    `[data-testid="sidebar-project-handle"][data-project-id="${projectId}"]`,
+  );
+  if (!(handle instanceof HTMLElement)) throw new Error(`项目拖拽把手不存在: ${projectId}`);
+  return handle;
+}
+
+/**
+ * happy-dom 的 DragEvent 不带 clientY，fireEvent.drop({ clientY }) 到不了
+ * 处理函数。补一个可取消的原生事件，让上下半区的落点能测。
+ */
+function dispatchProjectPointer(
+  element: HTMLElement,
+  type: 'dragover' | 'drop',
+  clientY: number,
+) {
+  const event = new Event(type, { bubbles: true, cancelable: true });
+  Object.defineProperty(event, 'clientY', { value: clientY });
+  act(() => {
+    element.dispatchEvent(event);
+  });
+}
+
+function projectBlock(projectId: string): HTMLElement {
+  const block = document.querySelector(
+    `[data-testid="sidebar-project"][data-project-id="${projectId}"]`,
+  );
+  if (!(block instanceof HTMLElement)) throw new Error(`项目块不存在: ${projectId}`);
+  return block;
+}
+
+/** happy-dom 的 getBoundingClientRect 恒为 0。按 data-project-id 给项目块一个高度，落点才能分出上下半。 */
+function installProjectRects(
+  rects: Record<string, { top: number; height: number }>,
+): () => void {
+  const original = HTMLElement.prototype.getBoundingClientRect;
+  HTMLElement.prototype.getBoundingClientRect = function () {
+    const id = this.getAttribute('data-project-id');
+    const spec = id ? rects[id] : undefined;
+    if (!spec) return original.call(this);
+    const { top, height } = spec;
+    return {
+      top,
+      bottom: top + height,
+      left: 0,
+      right: 160,
+      width: 160,
+      height,
+      x: 0,
+      y: top,
+      toJSON() {
+        return {};
+      },
+    } as DOMRect;
+  };
+  return () => {
+    HTMLElement.prototype.getBoundingClientRect = original;
+  };
 }
 
 /** 按 data-chat-id 取会话行容器。 */
@@ -306,7 +386,7 @@ describe('AgentSidebar 会话列表渲染', () => {
     renderSidebar('/agent', vi.fn(), {
       data: { chats: [makeChat({ id: 'c-plain', title: '普通会话' })] },
     });
-    expect(screen.queryByText('置顶')).toBeNull();
+    expect(screen.queryByText('Pinned')).toBeNull();
     expect(screen.queryByText('暂无置顶会话')).toBeNull();
   });
 
@@ -335,9 +415,9 @@ describe('AgentSidebar 会话列表渲染', () => {
     renderSidebar('/agent', vi.fn(), { data: { chats: [fresh, pinnedOld] } });
 
     // 组头顺序：置顶组在「今天」之前
-    expect(screen.getByText('置顶')).toBeTruthy();
-    const pinnedHeader = screen.getByText('置顶');
-    const todayHeader = screen.getByText('今天');
+    expect(screen.getByText('Pinned')).toBeTruthy();
+    const pinnedHeader = screen.getByText('Pinned');
+    const todayHeader = screen.getByText('Today');
     expect(
       pinnedHeader.compareDocumentPosition(todayHeader) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
@@ -350,10 +430,10 @@ describe('AgentSidebar 会话列表渲染', () => {
     const auto = makeChat({ id: 'c-auto', title: '[自动化] 每小时巡检' });
     renderSidebar('/agent', vi.fn(), { data: { chats: [auto] } });
 
-    const rowButton = screen.getByTitle('[由自动化触发] 每小时巡检');
+    const rowButton = screen.getByTitle('[Triggered by automation] 每小时巡检');
     expect(rowButton.textContent).toContain('每小时巡检');
     expect(rowButton.textContent).not.toContain('[自动化]');
-    expect(screen.getByLabelText('由自动化触发')).toBeTruthy();
+    expect(screen.getByLabelText('Triggered by automation')).toBeTruthy();
   });
 
   it('无项目会话按今天 / 昨天日期分组且新组在前', () => {
@@ -361,19 +441,19 @@ describe('AgentSidebar 会话列表渲染', () => {
     const yesterdayChat = makeChat({ id: 'c-yesterday', title: '昨天的会话', updatedAt: daysAgo(1) });
     renderSidebar('/agent', vi.fn(), { data: { chats: [yesterdayChat, todayChat] } });
 
-    expect(screen.getByText('今天')).toBeTruthy();
-    expect(screen.getByText('昨天')).toBeTruthy();
+    expect(screen.getByText('Today')).toBeTruthy();
+    expect(screen.getByText('Yesterday')).toBeTruthy();
     const ids = screen.getAllByTestId('sidebar-chat-row').map((r) => r.getAttribute('data-chat-id'));
     expect(ids).toEqual(['c-today', 'c-yesterday']);
   });
 
   it('空列表展示空态，加载中展示 spinner，错误走 alert 横幅', () => {
     const { unmount } = renderSidebar('/agent', vi.fn(), { data: { chats: [] } });
-    expect(screen.getByText('暂无会话')).toBeTruthy();
+    expect(screen.getByText('No chats yet')).toBeTruthy();
     unmount();
 
     const second = renderSidebar('/agent', vi.fn(), { data: { chats: [], isLoading: true } });
-    expect(screen.getByText('加载中...')).toBeTruthy();
+    expect(screen.getByText('Loading...')).toBeTruthy();
     second.unmount();
 
     renderSidebar('/agent', vi.fn(), { data: { error: '列表加载失败' } });
@@ -385,16 +465,16 @@ describe('AgentSidebar 会话列表渲染', () => {
       data: { chats: [existingChat, makeChat({ id: 'c-2', title: '第二条' })] },
     });
     expect(screen.queryByText('· 2')).toBeNull();
-    expect(screen.getByText('共 2 个会话')).toBeTruthy();
+    expect(screen.getByText('Total chats: 2')).toBeTruthy();
   });
 
   it('有更多页时底部提示继续下滑，加载中提示加载更多', () => {
     const { unmount } = renderSidebar('/agent', vi.fn(), { data: { hasMoreChats: true } });
-    expect(screen.getByText('继续下滑加载更多')).toBeTruthy();
+    expect(screen.getByText('Scroll down to load more')).toBeTruthy();
     unmount();
 
     renderSidebar('/agent', vi.fn(), { data: { hasMoreChats: true, isLoadingMoreChats: true } });
-    expect(screen.getByText('加载更多...')).toBeTruthy();
+    expect(screen.getByText('Loading more...')).toBeTruthy();
   });
 });
 
@@ -451,15 +531,15 @@ describe('AgentSidebar 会话行交互', () => {
 
     fireEvent.click(screen.getByText('已经聊过的对话'));
     expect(screen.getByTestId('loc').textContent).toBe('/agent/chat-with-content');
-    expect(screen.getByTestId('sidebar-chat-delete').getAttribute('aria-label')).toBe('删除会话');
+    expect(screen.getByTestId('sidebar-chat-delete').getAttribute('aria-label')).toBe('Delete chat');
   });
 
   it('会话区（最近）可折叠再展开', () => {
     renderSidebar('/agent');
-    fireEvent.click(screen.getByRole('button', { name: /^最近$/ }));
+    fireEvent.click(screen.getByRole('button', { name: /^Recent$/ }));
     expect(screen.queryByTestId('sidebar-chat-row')).toBeNull();
 
-    fireEvent.click(screen.getByRole('button', { name: /^最近$/ }));
+    fireEvent.click(screen.getByRole('button', { name: /^Recent$/ }));
     expect(screen.getByTestId('sidebar-chat-row')).toBeTruthy();
   });
 
@@ -473,9 +553,9 @@ describe('AgentSidebar 会话行交互', () => {
     const { unmount } = renderSidebar('/agent', vi.fn(), { data: { chats } });
     await screen.findByText('项目甲');
 
-    fireEvent.click(screen.getByRole('button', { name: /^置顶$/ }));
-    fireEvent.click(screen.getByRole('button', { name: /^项目$/ }));
-    fireEvent.click(screen.getByRole('button', { name: /^最近$/ }));
+    fireEvent.click(screen.getByRole('button', { name: /^Pinned$/ }));
+    fireEvent.click(screen.getByRole('button', { name: /^Projects$/ }));
+    fireEvent.click(screen.getByRole('button', { name: /^Recent$/ }));
     expect(screen.queryByText('置顶会话')).toBeNull();
     expect(screen.queryByText('项目甲')).toBeNull();
     expect(screen.queryByText('已经聊过的对话')).toBeNull();
@@ -487,21 +567,21 @@ describe('AgentSidebar 会话行交互', () => {
 
     unmount();
     renderSidebar('/agent', vi.fn(), { data: { chats } });
-    expect(screen.getByRole('button', { name: /^置顶$/ }).getAttribute('aria-expanded')).toBe(
+    expect(screen.getByRole('button', { name: /^Pinned$/ }).getAttribute('aria-expanded')).toBe(
       'false',
     );
-    expect(screen.getByRole('button', { name: /^项目$/ }).getAttribute('aria-expanded')).toBe(
+    expect(screen.getByRole('button', { name: /^Projects$/ }).getAttribute('aria-expanded')).toBe(
       'false',
     );
-    expect(screen.getByRole('button', { name: /^最近$/ }).getAttribute('aria-expanded')).toBe(
+    expect(screen.getByRole('button', { name: /^Recent$/ }).getAttribute('aria-expanded')).toBe(
       'false',
     );
     expect(screen.queryByText('置顶会话')).toBeNull();
     expect(screen.queryByText('已经聊过的对话')).toBeNull();
 
-    fireEvent.click(screen.getByRole('button', { name: /^置顶$/ }));
-    fireEvent.click(screen.getByRole('button', { name: /^项目$/ }));
-    fireEvent.click(screen.getByRole('button', { name: /^最近$/ }));
+    fireEvent.click(screen.getByRole('button', { name: /^Pinned$/ }));
+    fireEvent.click(screen.getByRole('button', { name: /^Projects$/ }));
+    fireEvent.click(screen.getByRole('button', { name: /^Recent$/ }));
     expect(screen.getByText('置顶会话')).toBeTruthy();
     await screen.findByText('项目甲');
     expect(screen.getByText('已经聊过的对话')).toBeTruthy();
@@ -523,10 +603,10 @@ describe('AgentSidebar 会话行交互', () => {
     renderSidebar('/agent', vi.fn(), { data: { chats: [pinnedChat] } });
     expect(screen.getByTestId('sidebar-chat-row')).toBeTruthy();
 
-    fireEvent.click(screen.getByRole('button', { name: /^置顶$/ }));
+    fireEvent.click(screen.getByRole('button', { name: /^Pinned$/ }));
     expect(screen.queryByTestId('sidebar-chat-row')).toBeNull();
 
-    fireEvent.click(screen.getByRole('button', { name: /^置顶$/ }));
+    fireEvent.click(screen.getByRole('button', { name: /^Pinned$/ }));
     expect(screen.getByTestId('sidebar-chat-row')).toBeTruthy();
   });
 
@@ -537,7 +617,7 @@ describe('AgentSidebar 会话行交互', () => {
     });
 
     const pinBtn = screen.getByTestId('sidebar-chat-pin');
-    expect(pinBtn.getAttribute('aria-label')).toBe('置顶会话');
+    expect(pinBtn.getAttribute('aria-label')).toBe('Pin chat');
 
     fireEvent.click(pinBtn);
     await waitFor(() =>
@@ -558,7 +638,7 @@ describe('AgentSidebar 会话行交互', () => {
     });
 
     const pinBtn = screen.getByTestId('sidebar-chat-pin');
-    expect(pinBtn.getAttribute('aria-label')).toBe('取消置顶');
+    expect(pinBtn.getAttribute('aria-label')).toBe('Unpin');
 
     fireEvent.click(pinBtn);
     await waitFor(() =>
@@ -575,7 +655,7 @@ describe('AgentSidebar 会话行交互', () => {
     });
     renderSidebar('/agent', vi.fn(), { data: { chats: [streamingChat] } });
 
-    expect(screen.getByLabelText('正在生成')).toBeTruthy();
+    expect(screen.getByLabelText('Generating')).toBeTruthy();
   });
 
   it('切到别的会话后，后台仍在生成的会话保留正在生成指示，结束后摘掉', async () => {
@@ -591,13 +671,13 @@ describe('AgentSidebar 会话行交互', () => {
         }),
       );
     });
-    expect(screen.getByLabelText('正在生成')).toBeTruthy();
+    expect(screen.getByLabelText('Generating')).toBeTruthy();
 
     await waitFor(() => expect(getChatLiveStream).toHaveBeenCalledWith('c-bg'));
-    expect(screen.getByLabelText('正在生成')).toBeTruthy();
+    expect(screen.getByLabelText('Generating')).toBeTruthy();
 
     getChatLiveStream.mockResolvedValue({ active: false });
-    await waitFor(() => expect(screen.queryByLabelText('正在生成')).toBeNull(), {
+    await waitFor(() => expect(screen.queryByLabelText('Generating')).toBeNull(), {
       timeout: 2500,
     });
   });
@@ -620,7 +700,7 @@ describe('AgentSidebar 会话行交互', () => {
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 20));
     });
-    expect(screen.getByLabelText('正在生成')).toBeTruthy();
+    expect(screen.getByLabelText('Generating')).toBeTruthy();
   });
 
   it('当前打开的会话不因 live-stream 暂时 inactive 丢掉正在生成指示', async () => {
@@ -636,13 +716,13 @@ describe('AgentSidebar 会话行交互', () => {
         }),
       );
     });
-    expect(screen.getByLabelText('正在生成')).toBeTruthy();
+    expect(screen.getByLabelText('Generating')).toBeTruthy();
 
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
     });
     expect(getChatLiveStream).not.toHaveBeenCalled();
-    expect(screen.getByLabelText('正在生成')).toBeTruthy();
+    expect(screen.getByLabelText('Generating')).toBeTruthy();
   });
 
   it('会话有问题需要用户输入时渲染待输入指示器', () => {
@@ -653,13 +733,13 @@ describe('AgentSidebar 会话行交互', () => {
     });
     renderSidebar('/agent', vi.fn(), { data: { chats: [inputChat] } });
 
-    expect(screen.getByLabelText('等待用户输入')).toBeTruthy();
+    expect(screen.getByLabelText('Waiting for user input')).toBeTruthy();
   });
 });
 
 describe('AgentSidebar 入口导航与高亮', () => {
   it('设置按钮右侧显示当前版本，侧栏没有检查更新', async () => {
-    bridgeStub = baseElectronBridge({
+    bridgeStub = baseHostBridge({
       app: {
         snapshot: async () => ({ version: '0.2.2', enabled: true, phase: 'idle' }),
         check: vi.fn(),
@@ -721,7 +801,7 @@ describe('AgentSidebar 入口导航与高亮', () => {
   it('收起按钮回调 onCollapse', () => {
     const onCollapse = vi.fn();
     renderSidebar('/agent', vi.fn(), { onCollapse });
-    fireEvent.click(screen.getByLabelText('收起侧边栏'));
+    fireEvent.click(screen.getByLabelText('Collapse sidebar'));
     expect(onCollapse).toHaveBeenCalledTimes(1);
   });
 });
@@ -750,7 +830,7 @@ describe('AgentSidebar 副作用', () => {
   it('订阅菜单新建对话事件：回调导航落地页，卸载时退订', () => {
     let menuCb: (() => void) | null = null;
     const offMenuNewChat = vi.fn();
-    bridgeStub = baseElectronBridge({
+    bridgeStub = baseHostBridge({
       onMenuNewChat: (cb) => {
         menuCb = cb;
       },
@@ -773,7 +853,7 @@ describe('AgentSidebar 副作用', () => {
 
   it('未触发导航直接卸载时，菜单订阅恰好退订一次', () => {
     const offMenuNewChat = vi.fn();
-    bridgeStub = baseElectronBridge({
+    bridgeStub = baseHostBridge({
       onMenuNewChat: () => {},
       offMenuNewChat,
     });
@@ -811,6 +891,47 @@ describe('AgentSidebar 副作用', () => {
 });
 
 describe('AgentSidebar 项目模式（Electron）', () => {
+  it('项目分组主动加载后续页，避免较旧会话被误报为空', async () => {
+    const scrollHeight = Object.getOwnPropertyDescriptor(
+      HTMLElement.prototype,
+      'scrollHeight',
+    );
+    const clientHeight = Object.getOwnPropertyDescriptor(
+      HTMLElement.prototype,
+      'clientHeight',
+    );
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
+      configurable: true,
+      get: () => 1_000,
+    });
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+      configurable: true,
+      get: () => 100,
+    });
+
+    try {
+      enterElectron([makeProject({ id: 'proj-old', name: '旧项目' })]);
+      const loadMoreChats = vi.fn(async () => {});
+      renderSidebar('/agent', vi.fn(), {
+        data: { hasMoreChats: true, loadMoreChats },
+      });
+
+      await screen.findByText('旧项目');
+      await waitFor(() => expect(loadMoreChats).toHaveBeenCalled());
+    } finally {
+      Object.defineProperty(
+        HTMLElement.prototype,
+        'scrollHeight',
+        scrollHeight ?? { configurable: true, get: () => 0 },
+      );
+      Object.defineProperty(
+        HTMLElement.prototype,
+        'clientHeight',
+        clientHeight ?? { configurable: true, get: () => 0 },
+      );
+    }
+  });
+
   it('项目分组渲染在前，孤儿会话回落到无项目日期分组', async () => {
     enterElectron([makeProject({ id: 'proj-1', name: '项目甲' })]);
     const inProject = makeChat({ id: 'c-in', title: '项目内会话', projectId: 'proj-1' });
@@ -827,7 +948,99 @@ describe('AgentSidebar 项目模式（Electron）', () => {
     expect(chatRow('c-in')).toBeTruthy();
     // 孤儿会话按无项目处理，进入日期分组。
     expect(chatRow('c-orphan')).toBeTruthy();
-    expect(screen.getByText('今天')).toBeTruthy();
+    expect(screen.getByText('Today')).toBeTruthy();
+  });
+
+  it('项目内超过 5 条先收起，每次再展开 5 条，收起项目后回到最初 5 条', async () => {
+    enterElectron([makeProject({ id: 'proj-1', name: '项目甲' })]);
+    const chats = Array.from({ length: 12 }, (_, index) =>
+      makeChat({
+        id: `c-${index + 1}`,
+        title: `会话 ${index + 1}`,
+        projectId: 'proj-1',
+        updatedAt: new Date(Date.UTC(2026, 0, 1, 12, 0, 12 - index)).toISOString(),
+      }),
+    );
+    renderSidebar('/agent', vi.fn(), { data: { chats } });
+
+    await screen.findByText('项目甲');
+    for (let index = 1; index <= 5; index += 1) {
+      expect(screen.getByText(`会话 ${index}`)).toBeTruthy();
+    }
+    expect(screen.queryByText('会话 6')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Show 7 more' })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Show 7 more' }));
+    expect(screen.getByText('会话 10')).toBeTruthy();
+    expect(screen.queryByText('会话 11')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Show 2 more' })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Show 2 more' }));
+    expect(screen.getByText('会话 12')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /Show \d+ more/ })).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Show less' }));
+    expect(screen.queryByText('会话 6')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Show 7 more' })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Show 7 more' }));
+    fireEvent.click(screen.getByText('项目甲').closest('button')!);
+    fireEvent.click(screen.getByText('项目甲').closest('button')!);
+    expect(screen.queryByText('会话 6')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Show 7 more' })).toBeTruthy();
+  });
+
+  it('正好 5 条不显示更多；进行中的会话和当前会话不占这 5 条名额', async () => {
+    enterElectron([
+      makeProject({ id: 'proj-1', name: '项目甲' }),
+      makeProject({ id: 'proj-2', name: '项目乙' }),
+      makeProject({ id: 'proj-3', name: '项目丙' }),
+    ]);
+    const streamingTail = Array.from({ length: 7 }, (_, index) =>
+      makeChat({
+        id: `c-${index + 1}`,
+        title: `甲 ${index + 1}`,
+        projectId: 'proj-1',
+        updatedAt: new Date(Date.UTC(2026, 0, 1, 12, 0, 7 - index)).toISOString(),
+        isStreaming: index === 6,
+      }),
+    );
+    const currentTail = Array.from({ length: 7 }, (_, index) =>
+      makeChat({
+        id: `b-${index + 1}`,
+        title: `乙 ${index + 1}`,
+        projectId: 'proj-2',
+        updatedAt: new Date(Date.UTC(2026, 0, 2, 12, 0, 7 - index)).toISOString(),
+      }),
+    );
+    const exactFive = Array.from({ length: 5 }, (_, index) =>
+      makeChat({
+        id: `fit-${index + 1}`,
+        title: `丙 ${index + 1}`,
+        projectId: 'proj-3',
+        updatedAt: new Date(Date.UTC(2026, 0, 3, 12, 0, 5 - index)).toISOString(),
+      }),
+    );
+    renderSidebar('/agent/b-7', vi.fn(), {
+      data: { chats: [...streamingTail, ...currentTail, ...exactFive] },
+    });
+
+    await screen.findByText('项目甲');
+    expect(screen.getByText('甲 7')).toBeTruthy();
+    expect(screen.queryByText('甲 6')).toBeNull();
+    expect(screen.getByText('甲 5')).toBeTruthy();
+    expect(screen.getAllByRole('button', { name: 'Show 1 more' })).toHaveLength(2);
+
+    expect(screen.getByText('乙 7')).toBeTruthy();
+    expect(screen.queryByText('乙 6')).toBeNull();
+    expect(screen.getByText('乙 5')).toBeTruthy();
+
+    for (let index = 1; index <= 5; index += 1) {
+      expect(screen.getByText(`丙 ${index}`)).toBeTruthy();
+    }
+    expect(
+      document.querySelector('[data-testid="sidebar-project-show-more"][data-project-id="proj-3"]'),
+    ).toBeNull();
   });
 
   it('项目组头可折叠再展开', async () => {
@@ -849,7 +1062,7 @@ describe('AgentSidebar 项目模式（Electron）', () => {
     renderSidebar('/agent');
 
     await screen.findByText('项目甲');
-    fireEvent.click(screen.getByTitle('在此项目下新建对话'));
+    fireEvent.click(screen.getByTitle('New chat in this project'));
     expect(screen.getByTestId('loc').textContent).toBe('/agent?projectId=proj-1');
   });
 
@@ -859,17 +1072,17 @@ describe('AgentSidebar 项目模式（Electron）', () => {
     renderSidebar('/agent');
 
     await screen.findByText('项目甲');
-    expect(screen.getByTitle('在此项目下新建对话')).toBeTruthy();
-    expect(screen.getByLabelText('项目菜单')).toBeTruthy();
-    expect(screen.queryByTitle('重命名项目')).toBeNull();
-    expect(screen.queryByTitle('编辑项目')).toBeNull();
+    expect(screen.getByTitle('New chat in this project')).toBeTruthy();
+    expect(screen.getByLabelText('Project menu')).toBeTruthy();
+    expect(screen.queryByTitle('Rename project')).toBeNull();
+    expect(screen.queryByTitle('Edit project')).toBeNull();
 
     openProjectMenu();
-    expect(screen.getByText('0 个会话')).toBeTruthy();
-    expect(screen.getByTitle('重命名项目')).toBeTruthy();
-    expect(screen.getByTitle('编辑项目')).toBeTruthy();
-    expect(screen.getByTitle('在访达中显示')).toBeTruthy();
-    expect(screen.getByTitle('删除项目（会话保留为无项目对话）')).toBeTruthy();
+    expect(screen.getByText('Chats: 0')).toBeTruthy();
+    expect(screen.getByTitle('Rename project')).toBeTruthy();
+    expect(screen.getByTitle('Edit project')).toBeTruthy();
+    expect(screen.getByTitle('Show in Finder')).toBeTruthy();
+    expect(screen.getByTitle('Delete project (its chats stay as chats without a project)')).toBeTruthy();
   });
 
   it('项目菜单：在访达中显示会打开项目文件夹', async () => {
@@ -879,7 +1092,7 @@ describe('AgentSidebar 项目模式（Electron）', () => {
 
     await screen.findByText('项目甲');
     openProjectMenu();
-    fireEvent.click(screen.getByTitle('在访达中显示'));
+    fireEvent.click(screen.getByTitle('Show in Finder'));
     await waitFor(() => expect(openLocalPath).toHaveBeenCalledWith('/tmp/proj-a'));
   });
 
@@ -888,7 +1101,7 @@ describe('AgentSidebar 项目模式（Electron）', () => {
     createProject.mockResolvedValue({ success: true, project: makeProject() });
     renderSidebar('/agent');
 
-    fireEvent.click(screen.getByLabelText('新建项目'));
+    fireEvent.click(screen.getByLabelText('New project'));
     expect(screen.getByTestId('create-project-dialog')).toBeTruthy();
     fireEvent.change(screen.getByTestId('create-project-name'), { target: { value: '演示项目' } });
     fireEvent.click(screen.getByTestId('create-project-submit'));
@@ -900,8 +1113,8 @@ describe('AgentSidebar 项目模式（Electron）', () => {
     enterElectron([]);
     renderSidebar('/agent');
 
-    fireEvent.click(screen.getByLabelText('新建项目'));
-    fireEvent.click(screen.getByRole('button', { name: '取消' }));
+    fireEvent.click(screen.getByLabelText('New project'));
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(screen.queryByTestId('create-project-dialog')).toBeNull();
     expect(createProject).not.toHaveBeenCalled();
   });
@@ -913,7 +1126,7 @@ describe('AgentSidebar 项目模式（Electron）', () => {
 
     await screen.findByText('项目甲');
     openProjectMenu();
-    fireEvent.click(screen.getByTitle('重命名项目'));
+    fireEvent.click(screen.getByTitle('Rename project'));
     const input = screen.getByDisplayValue('项目甲');
     fireEvent.change(input, { target: { value: '项目甲改' } });
     fireEvent.submit(input.closest('form')!);
@@ -928,7 +1141,7 @@ describe('AgentSidebar 项目模式（Electron）', () => {
 
     await screen.findByText('项目甲');
     openProjectMenu();
-    fireEvent.click(screen.getByTitle('重命名项目'));
+    fireEvent.click(screen.getByTitle('Rename project'));
     const input = screen.getByDisplayValue('项目甲');
     fireEvent.keyDown(input, { key: 'Escape' });
 
@@ -942,7 +1155,7 @@ describe('AgentSidebar 项目模式（Electron）', () => {
 
     await screen.findByText('项目甲');
     openProjectMenu();
-    fireEvent.click(screen.getByTitle('重命名项目'));
+    fireEvent.click(screen.getByTitle('Rename project'));
     const input = screen.getByDisplayValue('项目甲');
     fireEvent.change(input, { target: { value: '   ' } });
     fireEvent.submit(input.closest('form')!);
@@ -960,7 +1173,7 @@ describe('AgentSidebar 项目模式（Electron）', () => {
 
     await screen.findByText('项目甲');
     openProjectMenu();
-    fireEvent.click(screen.getByTitle('编辑项目'));
+    fireEvent.click(screen.getByTitle('Edit project'));
     expect(screen.getByTestId('edit-project-dialog')).toBeTruthy();
     expect(screen.getByText('/tmp/old')).toBeTruthy();
 
@@ -987,7 +1200,7 @@ describe('AgentSidebar 项目模式（Electron）', () => {
 
     await screen.findByText('项目甲');
     openProjectMenu();
-    fireEvent.click(screen.getByTitle('删除项目（会话保留为无项目对话）'));
+    fireEvent.click(screen.getByTitle('Delete project (its chats stay as chats without a project)'));
     expect(deleteProject).not.toHaveBeenCalled();
     expect(screen.queryByTestId('project-overflow-menu')).toBeNull();
     expect(screen.getByTestId('sidebar-delete-project-dialog').textContent).toContain('项目甲');
@@ -997,17 +1210,96 @@ describe('AgentSidebar 项目模式（Electron）', () => {
     expect(screen.queryByTestId('sidebar-delete-project-dialog')).toBeNull();
 
     openProjectMenu();
-    fireEvent.click(screen.getByTitle('删除项目（会话保留为无项目对话）'));
+    fireEvent.click(screen.getByTitle('Delete project (its chats stay as chats without a project)'));
     fireEvent.click(screen.getByTestId('sidebar-delete-project-dialog-confirm'));
     await waitFor(() => expect(deleteProject).toHaveBeenCalledWith('proj-1'));
     await waitFor(() => expect(data.refreshChats).toHaveBeenCalled());
+  });
+
+  it('拖拽项目组头到另一项目上半段时按新顺序保存', async () => {
+    const first = makeProject({ id: 'proj-1', name: '项目甲' });
+    const second = makeProject({ id: 'proj-2', name: '项目乙' });
+    enterElectron([first, second]);
+    reorderProjects.mockImplementation(async (ids: string[]) => ({
+      success: true,
+      projects: ids.map((id) => (id === first.id ? first : second)),
+    }));
+    renderSidebar('/agent');
+
+    await screen.findByText('项目乙');
+    expect(projectIds()).toEqual(['proj-1', 'proj-2']);
+
+    const restoreRects = installProjectRects({
+      'proj-1': { top: 0, height: 80 },
+      'proj-2': { top: 100, height: 80 },
+    });
+    try {
+      const target = projectBlock('proj-1');
+      fireEvent.dragStart(projectHandle('proj-2'));
+      dispatchProjectPointer(target, 'dragover', 10);
+      expect(screen.getByTestId('sidebar-project-drop-indicator')).toBeTruthy();
+      dispatchProjectPointer(target, 'drop', 10);
+    } finally {
+      restoreRects();
+    }
+
+    await waitFor(() => expect(reorderProjects).toHaveBeenCalledWith(['proj-2', 'proj-1']));
+    expect(projectIds()).toEqual(['proj-2', 'proj-1']);
+  });
+
+  it('落点没有改变顺序时不请求保存', async () => {
+    enterElectron([
+      makeProject({ id: 'proj-1', name: '项目甲' }),
+      makeProject({ id: 'proj-2', name: '项目乙' }),
+    ]);
+    renderSidebar('/agent');
+    await screen.findByText('项目乙');
+
+    const restoreRects = installProjectRects({
+      'proj-1': { top: 0, height: 80 },
+      'proj-2': { top: 100, height: 80 },
+    });
+    try {
+      fireEvent.dragStart(projectHandle('proj-1'));
+      dispatchProjectPointer(projectBlock('proj-2'), 'drop', 110);
+      fireEvent.dragEnd(projectHandle('proj-1'));
+    } finally {
+      restoreRects();
+    }
+
+    expect(reorderProjects).not.toHaveBeenCalled();
+    expect(projectIds()).toEqual(['proj-1', 'proj-2']);
+  });
+
+  it('排序保存失败时列表回到原来的顺序并显示错误', async () => {
+    enterElectron([
+      makeProject({ id: 'proj-1', name: '项目甲' }),
+      makeProject({ id: 'proj-2', name: '项目乙' }),
+    ]);
+    reorderProjects.mockRejectedValue(new Error('排序失败'));
+    renderSidebar('/agent');
+    await screen.findByText('项目乙');
+
+    const restoreRects = installProjectRects({
+      'proj-1': { top: 0, height: 80 },
+      'proj-2': { top: 100, height: 80 },
+    });
+    try {
+      fireEvent.dragStart(projectHandle('proj-2'));
+      dispatchProjectPointer(projectBlock('proj-1'), 'drop', 10);
+    } finally {
+      restoreRects();
+    }
+
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('排序失败'));
+    expect(projectIds()).toEqual(['proj-1', 'proj-2']);
   });
 
   it('项目列表拉取失败时错误进 alert 横幅', async () => {
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     listProjects.mockReset();
     listProjects.mockRejectedValue(new Error('存储读取失败'));
-    bridgeStub = baseElectronBridge();
+    bridgeStub = baseHostBridge();
     renderSidebar('/agent');
 
     await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('存储读取失败'));

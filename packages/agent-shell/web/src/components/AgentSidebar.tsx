@@ -56,11 +56,12 @@
  *   │ ✎ 新对话                        │  ← 只打开落地页，有内容才落库
  *   │ 🧩 插件                         │ ← /settings?section=plugins（智能体 / Skills / MCP / 网络搜索）
  *   │  会话 v                     📁+ │ ← 📁+ 打开新建项目弹窗
- *   │  v 📁 项目A          (hover: ✎··)│ ← ✎ 新建对话；·· 菜单：重命名/换目录/访达/删
- *   │   ...（项目内对话）              │
+ *   │  v 📁 项目A          (hover: ✎··)│ ← 拖拽组头排序；✎ 新建对话；·· 菜单：重命名/换目录/访达/删
+ *   │   ...（项目内对话，超过 5 条再展开）│
  *   │   今天                          │
  *   │   ...（无项目对话，按日期分组）  │ ← 无项目排在项目分组之后
  *   ├─────────────────────────────────┤
+ *   │ DeepSeek           可用 ↻   │ ← DeepSeek / Kimi 时显示供应商账户余额
  *   │ ⚙ 设置                   v0.2.2 │ ← /settings；右侧是当前版本，检查更新在设置页
  *   └─────────────────────────────────┘
  *
@@ -92,7 +93,7 @@ import {
 import { RiPushpin2Fill, RiPushpin2Line } from "react-icons/ri";
 import { parseChatTitle } from "@/lib/chat-title";
 import { getDateGroupLabel, getDateGroupPriority } from "@/lib/date-groups";
-import { getElectronBridge, isElectron } from "@/lib/electron-bridge";
+import { getHostBridge, hasHostBridge } from "@/lib/host-bridge";
 import { hasGeneralSettingsChrome, hostToolChrome, settingsChrome } from "@/lib/host-tools";
 import {
   createProject,
@@ -108,7 +109,11 @@ import {
 import { usePendingAskUserChatIds } from "@/components/chat/AskUserPromptProvider";
 import { usePendingApprovalChatIds } from "@/components/chat/ApprovalPromptProvider";
 import type { UseChatsAndAgentsResult } from "@/hooks/useChatsAndAgents";
-import { useProjects } from "@/hooks/useProjects";
+import { persistProjectOrder, useProjects } from "@/hooks/useProjects";
+import {
+  nextProjectOrder,
+  type ProjectDropPlace,
+} from "@/lib/project-order";
 import type { RightPanelState } from "@/layouts/AgentLayout";
 import { BrandLockup } from "@/components/BrandLockup";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
@@ -116,7 +121,51 @@ import {
   SidebarVersionLabel,
   useAppRelease,
 } from "@/components/SidebarRelease";
+import { SidebarAccount } from "@/components/SidebarAccount";
 import { CreateProjectModal } from "@/components/CreateProjectModal";
+import { t } from "@/i18n";
+
+function projectDropPlace(element: HTMLElement, clientY: number): ProjectDropPlace {
+  const rect = element.getBoundingClientRect();
+  return clientY < rect.top + rect.height / 2 ? "before" : "after";
+}
+
+/** 项目里先露出的普通会话条数。每一次「显示更多」再露出同样多条。 */
+const PROJECT_CHAT_PAGE = 5;
+
+/**
+ * 进行中、等待输入的会话保持原位，不占用这 5 条名额。
+ * 当前打开的会话如果落在名额之外，仍单独留在列表里。
+ */
+function visibleProjectChats<T extends { id: string }>(
+  items: readonly T[],
+  limit: number,
+  options: {
+    currentId?: string;
+    isAlwaysVisible: (chat: T) => boolean;
+  },
+): { rows: T[]; hiddenCount: number } {
+  let ordinary = 0;
+  const kept = new Set<string>();
+  for (const chat of items) {
+    if (options.isAlwaysVisible(chat)) {
+      kept.add(chat.id);
+      continue;
+    }
+    if (ordinary < limit) {
+      kept.add(chat.id);
+      ordinary += 1;
+    }
+  }
+  if (
+    options.currentId &&
+    items.some((chat) => chat.id === options.currentId)
+  ) {
+    kept.add(options.currentId);
+  }
+  const rows = items.filter((chat) => kept.has(chat.id));
+  return { rows, hiddenCount: items.length - rows.length };
+}
 
 function placeProjectMenu(anchor: HTMLElement): { top: number; left: number } {
   const box = anchor.getBoundingClientRect();
@@ -169,7 +218,7 @@ function ProjectOverflowMenu({
             <span className="min-w-0 truncate">{project.name}</span>
           </div>
           <div className="mt-0.5 pl-[22px] text-[10px] text-agent-muted-foreground">
-            {chatCount} 个会话
+            {t("Chats: {count}", { count: chatCount })}
           </div>
           <div
             className="mt-0.5 truncate pl-[22px] font-mono text-[10px] text-agent-muted-foreground/70"
@@ -182,22 +231,22 @@ function ProjectOverflowMenu({
         <button
           type="button"
           role="menuitem"
-          title="重命名项目"
+          title={t("Rename project")}
           onClick={onRename}
           className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs text-agent-foreground hover:bg-agent-foreground/5"
         >
           <LuPencil className="h-3.5 w-3.5 shrink-0 text-agent-muted-foreground" />
-          重命名
+          {t("Rename")}
         </button>
         <button
           type="button"
           role="menuitem"
-          title="编辑项目"
+          title={t("Edit project")}
           onClick={onChangeFolder}
           className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs text-agent-foreground hover:bg-agent-foreground/5"
         >
           <LuFolderOpen className="h-3.5 w-3.5 shrink-0 text-agent-muted-foreground" />
-          编辑项目
+          {t("Edit project")}
         </button>
         {onReveal && (
         <button
@@ -215,12 +264,12 @@ function ProjectOverflowMenu({
         <button
           type="button"
           role="menuitem"
-          title="删除项目（会话保留为无项目对话）"
+          title={t("Delete project (its chats stay as chats without a project)")}
           onClick={onDelete}
           className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs text-agent-foreground hover:bg-agent-destructive/10"
         >
           <LuTrash2 className="h-3.5 w-3.5 shrink-0" />
-          删除项目
+          {t("Delete project")}
         </button>
       </div>
     </>,
@@ -289,7 +338,7 @@ export function AgentSidebar({
   const navigate = useNavigate();
   const location = useLocation();
   const { chatId: currentChatId } = useParams<{ chatId?: string }>();
-  const bridge = getElectronBridge();
+  const bridge = getHostBridge();
   const release = useAppRelease();
   const onSettingsPage = location.pathname === "/settings";
   // 插件页（及旧的 agents/skills/mcp 深链）高亮「插件」；其余 /settings 高亮底部综合设置。
@@ -384,7 +433,7 @@ export function AgentSidebar({
     const backgroundIds = [...streamingChatIds].filter(
       (id) => id !== currentChatId,
     );
-    if (backgroundIds.length === 0 || !isElectron()) return;
+    if (backgroundIds.length === 0 || !hasHostBridge()) return;
 
     let cancelled = false;
     let ticking = false;
@@ -478,6 +527,10 @@ export function AgentSidebar({
   const [collapsedProjectIds, setCollapsedProjectIds] = useState<Set<string>>(
     () => new Set(),
   );
+  // 每个项目已展开的普通会话名额。缺省是 PROJECT_CHAT_PAGE；Infinity 表示已全部展开。
+  const [projectChatLimits, setProjectChatLimits] = useState<
+    Record<string, number>
+  >({});
   const [renamingProjectId, setRenamingProjectId] = useState<string | null>(
     null,
   );
@@ -494,6 +547,37 @@ export function AgentSidebar({
     id: string;
     anchor: HTMLElement;
   } | null>(null);
+  const draggingProjectIdRef = useRef<string | null>(null);
+  const projectDragMovedRef = useRef(false);
+  const [draggingProjectId, setDraggingProjectId] = useState<string | null>(
+    null,
+  );
+  const [dropTarget, setDropTarget] = useState<{
+    id: string;
+    place: ProjectDropPlace;
+  } | null>(null);
+
+  const endProjectDrag = useCallback(() => {
+    draggingProjectIdRef.current = null;
+    setDraggingProjectId(null);
+    setDropTarget(null);
+    // dragend 之后浏览器有时还会补一次 click。等这次 click 过去再清标记，
+    // 避免松手把项目折叠掉；下一次真正的点击仍能折叠。
+    window.setTimeout(() => {
+      projectDragMovedRef.current = false;
+    }, 0);
+  }, []);
+
+  useEffect(() => {
+    if (!draggingProjectId) return;
+    const { cursor, userSelect } = document.body.style;
+    document.body.style.cursor = "grabbing";
+    document.body.style.userSelect = "none";
+    return () => {
+      document.body.style.cursor = cursor;
+      document.body.style.userSelect = userSelect;
+    };
+  }, [draggingProjectId]);
 
   const showProjectsChrome = hostToolChrome("projects");
 
@@ -589,14 +673,49 @@ export function AgentSidebar({
     }
   }, []);
 
-  const toggleProjectCollapsed = useCallback((projectId: string) => {
-    setCollapsedProjectIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(projectId)) next.delete(projectId);
-      else next.add(projectId);
-      return next;
-    });
-  }, []);
+  const toggleProjectCollapsed = useCallback(
+    (projectId: string) => {
+      const collapsing = !collapsedProjectIds.has(projectId);
+      setCollapsedProjectIds((prev) => {
+        const next = new Set(prev);
+        if (next.has(projectId)) next.delete(projectId);
+        else next.add(projectId);
+        return next;
+      });
+      // 收起项目后再打开，回到最初的 5 条，不记住上次展开到第几页。
+      if (collapsing) {
+        setProjectChatLimits((limits) => {
+          if (limits[projectId] === undefined) return limits;
+          const next = { ...limits };
+          delete next[projectId];
+          return next;
+        });
+      }
+    },
+    [collapsedProjectIds],
+  );
+
+  const revealMoreProjectChats = useCallback(
+    (projectId: string, hiddenCount: number) => {
+      setProjectChatLimits((limits) => {
+        if (hiddenCount === 0) {
+          if (limits[projectId] === undefined) return limits;
+          const next = { ...limits };
+          delete next[projectId];
+          return next;
+        }
+        const current = limits[projectId] ?? PROJECT_CHAT_PAGE;
+        return {
+          ...limits,
+          [projectId]:
+            hiddenCount <= PROJECT_CHAT_PAGE
+              ? Number.POSITIVE_INFINITY
+              : current + PROJECT_CHAT_PAGE,
+        };
+      });
+    },
+    [],
+  );
 
   // Keep the shared "next new chat" agent aligned with the current chat. The
   // actual picker now lives in ChatInput, so the sidebar no longer renders the
@@ -644,7 +763,7 @@ export function AgentSidebar({
         const { displayTitle, isAutomation } = parseChatTitle(chat.title);
         return {
           id: chat.id,
-          title: displayTitle || "新会话",
+          title: displayTitle || t("New conversation"),
           isAutomation,
           isPinned: chat.isPinned,
           sortDate,
@@ -710,7 +829,7 @@ export function AgentSidebar({
         if (!map.has(label)) {
           map.set(label, {
             label,
-            priority: getDateGroupPriority(label),
+            priority: getDateGroupPriority(chat.sortDate),
             items: [],
           });
         }
@@ -746,7 +865,7 @@ export function AgentSidebar({
         await setChatPinned(id, nextPinned);
         await refreshChats();
       } catch (err) {
-        console.error("切换会话置顶失败:", err);
+        console.error("Failed to toggle chat pin:", err);
       } finally {
         setPinningChatId(null);
       }
@@ -787,22 +906,24 @@ export function AgentSidebar({
               : "text-agent-muted-foreground hover:bg-agent-foreground/5 hover:text-agent-foreground",
           ].join(" ")}
           title={
-            chat.isAutomation ? `[由自动化触发] ${chat.title}` : chat.title
+            chat.isAutomation
+              ? t("[Triggered by automation] {title}", { title: chat.title })
+              : chat.title
           }
         >
           {needsUserInput ? (
             <span
               className="flex shrink-0 items-center justify-center text-amber-500 dark:text-amber-400"
-              title="有问题需要输入"
-              aria-label="等待用户输入"
+              title={t("Has a question that needs your input")}
+              aria-label={t("Waiting for user input")}
             >
               <LuCircleHelp className="h-3.5 w-3.5 animate-pulse" />
             </span>
           ) : isStreaming ? (
             <span
               className="flex shrink-0 items-center justify-center text-agent-foreground/70"
-              title="正在对话中"
-              aria-label="正在生成"
+              title={t("Conversation in progress")}
+              aria-label={t("Generating")}
             >
               <LuLoaderCircle className="h-3.5 w-3.5 animate-spin" />
             </span>
@@ -810,7 +931,7 @@ export function AgentSidebar({
           {chat.isAutomation && (
             <LuCloudCog
               className="h-3 w-3 shrink-0 text-agent-muted-foreground"
-              aria-label="由自动化触发"
+              aria-label={t("Triggered by automation")}
             />
           )}
           <span className="min-w-0 truncate leading-none">{chat.title}</span>
@@ -832,8 +953,8 @@ export function AgentSidebar({
             }}
             disabled={isPinning}
             className="flex h-6 w-6 items-center justify-center rounded-full text-agent-foreground/70 transition-all duration-200 hover:bg-agent-foreground/10 hover:text-agent-foreground disabled:cursor-not-allowed"
-            title={chat.isPinned ? "取消置顶" : "置顶会话"}
-            aria-label={chat.isPinned ? "取消置顶" : "置顶会话"}
+            title={chat.isPinned ? t("Unpin") : t("Pin chat")}
+            aria-label={chat.isPinned ? t("Unpin") : t("Pin chat")}
             data-testid="sidebar-chat-pin"
           >
             {chat.isPinned ? (
@@ -850,8 +971,8 @@ export function AgentSidebar({
             }}
             disabled={isDeleting}
             className="flex h-6 w-6 items-center justify-center rounded-full text-agent-foreground/70 transition-all duration-200 hover:bg-agent-foreground/10 hover:text-agent-destructive disabled:cursor-not-allowed disabled:opacity-100"
-            title="删除会话"
-            aria-label="删除会话"
+            title={t("Delete chat")}
+            aria-label={t("Delete chat")}
             data-testid="sidebar-chat-delete"
           >
             <LuTrash2
@@ -878,7 +999,9 @@ export function AgentSidebar({
     };
   }, [bridge, handleOpenNewChat]);
 
-  // Auto-load next page when the chat scroller approaches the bottom.
+  // Auto-load next page when the chat scroller approaches the bottom. Project
+  // groups need the complete list: otherwise an older project chat outside the
+  // first page makes its project incorrectly render as empty.
   // Throttled by `isLoadingMoreChats` inside the hook.
   useEffect(() => {
     const container = chatScrollRef.current;
@@ -889,7 +1012,9 @@ export function AgentSidebar({
       const nearBottom =
         container.scrollTop + container.clientHeight >=
         container.scrollHeight - 60;
-      if (nearBottom) void loadMoreChats();
+      const needsCompleteProjectGroups =
+        showProjectsChrome && projects.length > 0;
+      if (nearBottom || needsCompleteProjectGroups) void loadMoreChats();
     };
     container.addEventListener("scroll", maybeLoadMore, { passive: true });
     const tickId = window.requestAnimationFrame(maybeLoadMore);
@@ -903,9 +1028,27 @@ export function AgentSidebar({
     loadMoreChats,
     isRecentsExpanded,
     normalizedChats.length,
+    projects.length,
+    showProjectsChrome,
   ]);
 
-  const hasElectron = isElectron();
+  const hasElectron = hasHostBridge();
+
+  const projectChatWindow = (
+    items: typeof normalizedChats,
+    limit: number,
+  ) =>
+    visibleProjectChats(items, limit, {
+      currentId: currentChatId,
+      isAlwaysVisible: (chat) =>
+        Boolean(
+          chat.isStreaming ||
+            streamingChatIds.has(chat.id) ||
+            chat.needsUserInput ||
+            pendingAskUserChatIds.has(chat.id) ||
+            pendingApprovalChatIds.has(chat.id),
+        ),
+    });
 
   return (
     <div className="flex h-full w-full flex-col border-r border-agent-border/60 bg-agent-muted/70 backdrop-blur-md">
@@ -917,8 +1060,8 @@ export function AgentSidebar({
             type="button"
             onClick={onCollapse}
             className="flex h-7 w-7 items-center justify-center rounded-full text-agent-muted-foreground transition-colors duration-200 hover:bg-agent-foreground/5 hover:text-agent-foreground"
-            title="收起侧边栏"
-            aria-label="收起侧边栏"
+            title={t("Collapse sidebar")}
+            aria-label={t("Collapse sidebar")}
           >
             <LuPanelLeftClose className="h-3.5 w-3.5" />
           </button>
@@ -938,11 +1081,11 @@ export function AgentSidebar({
                 ? "bg-agent-foreground/10 font-medium text-agent-foreground"
                 : "text-agent-muted-foreground hover:bg-agent-foreground/5 hover:text-agent-foreground",
             ].join(" ")}
-            title="新建对话"
+            title={t("Start a new chat")}
             data-testid="sidebar-new-chat"
           >
             <LuSquarePen className="h-3.5 w-3.5" />
-            <span>新对话</span>
+            <span>{t("New chat")}</span>
           </button>
           {pluginsAvailable && (
           <button
@@ -954,11 +1097,11 @@ export function AgentSidebar({
                 ? "bg-agent-foreground/10 font-medium text-agent-foreground"
                 : "text-agent-muted-foreground hover:bg-agent-foreground/5 hover:text-agent-foreground",
             ].join(" ")}
-            title="插件"
+            title={t("Plugins")}
             data-testid="sidebar-plugins"
           >
             <LuBlocks className="h-3.5 w-3.5" />
-            <span>插件</span>
+            <span>{t("Plugins")}</span>
           </button>
           )}
         </div>
@@ -970,7 +1113,7 @@ export function AgentSidebar({
           {isChatLoading && chats.length === 0 && projects.length === 0 ? (
             <div className="flex items-center justify-center py-4 text-xs text-agent-muted-foreground">
               <LuLoaderCircle className="mr-1.5 h-3 w-3 animate-spin" />
-              加载中...
+              {t("Loading...")}
             </div>
           ) : (
             <>
@@ -988,7 +1131,7 @@ export function AgentSidebar({
                     }}
                     className="flex flex-1 min-w-0 items-center gap-1 text-left font-medium text-agent-muted-foreground hover:text-agent-foreground"
                   >
-                    <span>置顶</span>
+                    <span>{t("Pinned")}</span>
                     {isPinnedExpanded ? (
                       <LuChevronDown className="h-3 w-3 shrink-0 opacity-70" />
                     ) : (
@@ -1018,7 +1161,7 @@ export function AgentSidebar({
                       }}
                       className="flex flex-1 min-w-0 items-center gap-1 text-left font-medium text-agent-muted-foreground hover:text-agent-foreground"
                     >
-                      <span>项目</span>
+                      <span>{t("Projects")}</span>
                       {isProjectsExpanded ? (
                         <LuChevronDown className="h-3 w-3 shrink-0 opacity-70" />
                       ) : (
@@ -1033,8 +1176,8 @@ export function AgentSidebar({
                           setCreateProjectOpen(true);
                         }}
                         className="flex h-5 w-5 items-center justify-center rounded-full text-agent-muted-foreground opacity-0 transition-opacity duration-200 hover:bg-agent-foreground/10 hover:text-agent-foreground group-hover/section:opacity-100 focus:opacity-100"
-                        title="新建项目"
-                        aria-label="新建项目"
+                        title={t("New project")}
+                        aria-label={t("New project")}
                       >
                         <LuFolderPlus className="h-3.5 w-3.5" />
                       </button>
@@ -1044,12 +1187,79 @@ export function AgentSidebar({
                     <div className="space-y-0.5">
                       {projectGroups.length === 0 ? (
                         <div className="px-2.5 py-1 text-[11px] text-agent-muted-foreground/60">
-                          暂无项目
+                          {t("No projects")}
                         </div>
                       ) : (
                         projectGroups.map(({ project, items }) => (
-                          <div key={project.id} className="mb-1">
-                            <div className="group/proj relative">
+                          <div
+                            key={project.id}
+                            data-testid="sidebar-project"
+                            data-project-id={project.id}
+                            className="relative pb-1"
+                            onDragOver={(event) => {
+                              if (!draggingProjectIdRef.current) return;
+                              event.preventDefault();
+                              if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+                              const place = projectDropPlace(
+                                event.currentTarget,
+                                event.clientY,
+                              );
+                              setDropTarget((current) =>
+                                current?.id === project.id && current.place === place
+                                  ? current
+                                  : { id: project.id, place },
+                              );
+                            }}
+                            onDragLeave={(event) => {
+                              const next = event.relatedTarget;
+                              if (
+                                next instanceof Node &&
+                                event.currentTarget.contains(next)
+                              ) {
+                                return;
+                              }
+                              setDropTarget((current) =>
+                                current?.id === project.id ? null : current,
+                              );
+                            }}
+                            onDrop={(event) => {
+                              event.preventDefault();
+                              const fromId = draggingProjectIdRef.current;
+                              const place = projectDropPlace(
+                                event.currentTarget,
+                                event.clientY,
+                              );
+                              endProjectDrag();
+                              if (!fromId) return;
+                              const next = nextProjectOrder(
+                                projectGroups.map((group) => group.project.id),
+                                fromId,
+                                project.id,
+                                place,
+                              );
+                              if (!next) return;
+                              void persistProjectOrder(next).catch((err) => {
+                                setProjectError(
+                                  err instanceof Error ? err.message : String(err),
+                                );
+                              });
+                            }}
+                          >
+                            {dropTarget?.id === project.id && draggingProjectId ? (
+                              <div
+                                className={[
+                                  "pointer-events-none absolute inset-x-2 z-10 h-0.5 rounded-full bg-agent-foreground",
+                                  dropTarget.place === "before" ? "top-0" : "bottom-1",
+                                ].join(" ")}
+                                data-testid="sidebar-project-drop-indicator"
+                              />
+                            ) : null}
+                            <div
+                              className={[
+                                "group/proj relative",
+                                draggingProjectId === project.id ? "opacity-40" : "",
+                              ].join(" ")}
+                            >
                               {renamingProjectId === project.id ? (
                                 <form
                                   className="flex items-center px-2.5 pb-1 pt-1.5"
@@ -1076,8 +1286,31 @@ export function AgentSidebar({
                                 <>
                                   <button
                                     type="button"
-                                    onClick={() => toggleProjectCollapsed(project.id)}
-                                    className="flex w-full min-w-0 items-center px-2 pb-0.5 pt-1 text-[11px] font-medium text-agent-muted-foreground/90 transition-colors hover:text-agent-foreground"
+                                    draggable
+                                    data-testid="sidebar-project-handle"
+                                    data-project-id={project.id}
+                                    onDragStart={(event) => {
+                                      projectDragMovedRef.current = true;
+                                      draggingProjectIdRef.current = project.id;
+                                      setDraggingProjectId(project.id);
+                                      const transfer = event.dataTransfer;
+                                      if (!transfer) return;
+                                      transfer.effectAllowed = "move";
+                                      try {
+                                        transfer.setData("text/plain", project.name);
+                                      } catch (error) {
+                                        // 排序状态记在 ref 里。个别环境拒绝写入 DataTransfer。
+                                        void error;
+                                      }
+                                    }}
+                                    onDragEnd={() => {
+                                      endProjectDrag();
+                                    }}
+                                    onClick={() => {
+                                      if (projectDragMovedRef.current) return;
+                                      toggleProjectCollapsed(project.id);
+                                    }}
+                                    className="flex w-full min-w-0 cursor-grab items-center px-2 pb-0.5 pt-1 text-[11px] font-medium text-agent-muted-foreground/90 transition-colors hover:text-agent-foreground active:cursor-grabbing"
                                     title={`${project.name}\n${project.folderPath}`}
                                   >
                                     <LuFolder className="mr-1 h-3.5 w-3.5 shrink-0" />
@@ -1095,21 +1328,21 @@ export function AgentSidebar({
                                   <div
                                     className={`absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5 transition-opacity ${
                                       projectMenu?.id === project.id
-                                        ? "opacity-100"
-                                        : "opacity-0 group-hover/proj:opacity-100"
+                                        ? "pointer-events-auto opacity-100"
+                                        : "pointer-events-none opacity-0 group-hover/proj:pointer-events-auto group-hover/proj:opacity-100"
                                     }`}
                                   >
                                     <button
                                       type="button"
                                       onClick={() => handleOpenNewChat(project.id)}
                                       className="flex h-5 w-5 items-center justify-center rounded-full text-agent-muted-foreground hover:bg-agent-foreground/10 hover:text-agent-foreground"
-                                      title="在此项目下新建对话"
+                                      title={t("New chat in this project")}
                                     >
                                       <LuSquarePen className="h-3 w-3" />
                                     </button>
                                     <button
                                       type="button"
-                                      aria-label="项目菜单"
+                                      aria-label={t("Project menu")}
                                       aria-expanded={projectMenu?.id === project.id}
                                       onClick={(event) => {
                                         const button = event.currentTarget;
@@ -1120,7 +1353,7 @@ export function AgentSidebar({
                                         );
                                       }}
                                       className="flex h-5 w-5 items-center justify-center rounded-full text-agent-muted-foreground hover:bg-agent-foreground/10 hover:text-agent-foreground"
-                                      title="项目菜单"
+                                      title={t("Project menu")}
                                     >
                                       <LuEllipsis className="h-3 w-3" />
                                     </button>
@@ -1132,10 +1365,48 @@ export function AgentSidebar({
                               <div className="space-y-0.5 pl-2">
                                 {items.length === 0 ? (
                                   <div className="px-2.5 py-0.5 text-[11px] text-agent-muted-foreground/60">
-                                    暂无会话 — hover 项目名点 + 新建
+                                    {t("No chats yet. Hover the project name and click + to start one.")}
                                   </div>
                                 ) : (
-                                  items.map((chat) => renderChatRow(chat))
+                                  (() => {
+                                    const limit =
+                                      projectChatLimits[project.id] ??
+                                      PROJECT_CHAT_PAGE;
+                                    const folded = projectChatWindow(
+                                      items,
+                                      PROJECT_CHAT_PAGE,
+                                    );
+                                    const shown = projectChatWindow(items, limit);
+                                    const fullyShown = shown.hiddenCount === 0;
+                                    return (
+                                      <>
+                                        {shown.rows.map((chat) =>
+                                          renderChatRow(chat),
+                                        )}
+                                        {folded.hiddenCount > 0 && (
+                                          <button
+                                            type="button"
+                                            data-testid="sidebar-project-show-more"
+                                            data-project-id={project.id}
+                                            aria-expanded={fullyShown}
+                                            onClick={() =>
+                                              revealMoreProjectChats(
+                                                project.id,
+                                                shown.hiddenCount,
+                                              )
+                                            }
+                                            className="flex h-7 w-full items-center rounded-full px-2.5 text-left text-[11px] text-agent-muted-foreground/80 transition-colors hover:bg-agent-foreground/5 hover:text-agent-foreground"
+                                          >
+                                            {fullyShown
+                                              ? t("Show less")
+                                              : t("Show {count} more", {
+                                                  count: shown.hiddenCount,
+                                                })}
+                                          </button>
+                                        )}
+                                      </>
+                                    );
+                                  })()
                                 )}
                               </div>
                             )}
@@ -1160,7 +1431,7 @@ export function AgentSidebar({
                     }}
                     className="flex flex-1 min-w-0 items-center gap-1 text-left font-medium text-agent-muted-foreground hover:text-agent-foreground"
                   >
-                    <span>最近</span>
+                    <span>{t("Recent")}</span>
                     {isRecentsExpanded ? (
                       <LuChevronDown className="h-3 w-3 shrink-0 opacity-70" />
                     ) : (
@@ -1175,8 +1446,8 @@ export function AgentSidebar({
                         handleOpenNewChat();
                       }}
                       className="flex h-5 w-5 items-center justify-center rounded-full text-agent-muted-foreground hover:bg-agent-foreground/10 hover:text-agent-foreground"
-                      title="新对话"
-                      aria-label="新对话"
+                      title={t("New chat")}
+                      aria-label={t("New chat")}
                     >
                       <LuSquarePen className="h-3 w-3" />
                     </button>
@@ -1188,11 +1459,11 @@ export function AgentSidebar({
                       chats.length === 0 && projects.length === 0 ? (
                         <div className="flex flex-col items-center gap-1.5 py-4 text-xs text-agent-muted-foreground">
                           <LuMessageSquare className="h-4 w-4 text-agent-muted-foreground/60" />
-                          暂无会话
+                          {t("No chats yet")}
                         </div>
                       ) : (
                         <div className="px-2.5 py-1 text-[11px] text-agent-muted-foreground/60">
-                          暂无会话
+                          {t("No chats yet")}
                         </div>
                       )
                     ) : (
@@ -1217,12 +1488,12 @@ export function AgentSidebar({
               {isLoadingMoreChats ? (
                 <span className="inline-flex items-center gap-1">
                   <LuLoaderCircle className="h-3 w-3 animate-spin" />
-                  加载更多...
+                  {t("Loading more...")}
                 </span>
               ) : hasMoreChats ? (
-                "继续下滑加载更多"
+                t("Scroll down to load more")
               ) : (
-                `共 ${normalizedChats.length} 个会话`
+                t("Total chats: {count}", { count: normalizedChats.length })
               )}
             </div>
           )}
@@ -1240,6 +1511,7 @@ export function AgentSidebar({
 
       {/* ───── Footer: 设置 ───── */}
       <div className="flex-shrink-0 border-t border-agent-border/40 px-2.5 py-1.5">
+        <SidebarAccount />
         {hasGeneralSettingsChrome() && (
         <button
           type="button"
@@ -1250,11 +1522,11 @@ export function AgentSidebar({
               ? "bg-agent-foreground/10 font-medium text-agent-foreground"
               : "text-agent-muted-foreground hover:bg-agent-foreground/5 hover:text-agent-foreground",
           ].join(" ")}
-          title="设置"
+          title={t("Settings")}
           data-testid="sidebar-llm-settings"
         >
           <LuSettings className="h-3.5 w-3.5" />
-          <span>设置</span>
+          <span>{t("Settings")}</span>
           <SidebarVersionLabel release={release} />
         </button>
         )}
@@ -1277,7 +1549,7 @@ export function AgentSidebar({
               project={project}
               chatCount={chatCount}
               anchor={projectMenu.anchor}
-              revealLabel={isMac ? "在访达中显示" : "在文件管理器中显示"}
+              revealLabel={isMac ? t("Show in Finder") : t("Show in file manager")}
               onClose={closeProjectMenu}
               onRename={() => {
                 setProjectMenu(null);
@@ -1306,12 +1578,15 @@ export function AgentSidebar({
 
       <ConfirmDialog
         open={pendingDeleteChat !== null}
-        title="删除会话"
+        title={t("Delete chat")}
         description={
           pendingDeleteChat
-            ? `确定删除「${pendingDeleteChat.title}」？此操作无法撤销。`
+            ? t("Delete \"{title}\"? This cannot be undone.", {
+                title: pendingDeleteChat.title,
+              })
             : ""
         }
+        error={pendingDeleteChat ? error : null}
         pending={
           pendingDeleteChat !== null && deletingChatId === pendingDeleteChat.id
         }
@@ -1324,13 +1599,16 @@ export function AgentSidebar({
       />
       <ConfirmDialog
         open={pendingDeleteProject !== null}
-        title="删除项目"
+        title={t("Delete project")}
         description={
           pendingDeleteProject
-            ? `确定删除项目「${pendingDeleteProject.name}」？会话会保留为无项目对话。`
+            ? t(
+                "Delete project \"{name}\"? Its chats will stay as chats without a project.",
+                { name: pendingDeleteProject.name },
+              )
             : ""
         }
-        confirmLabel="删除项目"
+        confirmLabel={t("Delete project")}
         pending={
           pendingDeleteProject !== null &&
           deletingProjectId === pendingDeleteProject.id

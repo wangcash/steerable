@@ -6,6 +6,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  followedPreviewPath,
   formatFileSize,
   formatIntermediateDisplayPath,
   getDeliverableMeta,
@@ -13,6 +14,7 @@ import {
   groupTurnFiles,
   isIgnoredTurnFile,
   parseTurnFiles,
+  previewPathForTurn,
   splitTurnFilePath,
   type TurnFile,
 } from './turn-files';
@@ -59,6 +61,28 @@ describe('parseTurnFiles', () => {
         additions: 110,
         deletions: 0,
         category: 'intermediate',
+      },
+    ]);
+  });
+
+  it('保留后端已经解析的选择状态与证据来源', () => {
+    expect(
+      parseTurnFiles([
+        {
+          path: '/proj/报告.pdf',
+          kind: 'created',
+          category: 'deliverable',
+          selection: 'resolved',
+          deliverySource: 'final-reference',
+        },
+      ]),
+    ).toEqual([
+      {
+        path: '/proj/报告.pdf',
+        kind: 'created',
+        category: 'deliverable',
+        selection: 'resolved',
+        deliverySource: 'final-reference',
       },
     ]);
   });
@@ -118,25 +142,25 @@ describe('getTurnFileCategory & getDeliverableMeta', () => {
 
   it('提供正确的展示元数据', () => {
     expect(getDeliverableMeta('/work/报价.xlsx')).toEqual({
-      label: '电子表格',
+      label: 'Spreadsheet',
       extBadge: 'XLSX',
       kind: 'spreadsheet',
       themeColor: 'emerald',
     });
     expect(getDeliverableMeta('/work/演示.pptx')).toEqual({
-      label: '演示文稿',
+      label: 'Presentation',
       extBadge: 'PPTX',
       kind: 'presentation',
       themeColor: 'amber',
     });
     expect(getDeliverableMeta('/work/文档.pdf')).toEqual({
-      label: '文档',
+      label: 'Document',
       extBadge: 'PDF',
       kind: 'pdf',
       themeColor: 'rose',
     });
     expect(getDeliverableMeta('/work/图片.png')).toEqual({
-      label: '图像',
+      label: 'Image',
       extBadge: 'PNG',
       kind: 'image',
       themeColor: 'purple',
@@ -174,5 +198,104 @@ describe('groupTurnFiles', () => {
     expect(intermediates).toHaveLength(3);
     expect(totalAdditions).toBe(205);
     expect(totalDeletions).toBe(0);
+  });
+
+  it('同名预览 PDF 不和幻灯片一起占卡片；只标了预览时改升幻灯片', () => {
+    const deck = '/work/4432-自我介绍.pptx';
+    const preview = '/work/4432-自我介绍-预览.pdf';
+    const both = groupTurnFiles([
+      { path: deck, kind: 'created', category: 'deliverable', description: '10 页可编辑自我介绍' },
+      {
+        path: preview,
+        kind: 'created',
+        category: 'deliverable',
+        description: '图像版预览 PDF，用于快速查看与分享',
+      },
+    ]);
+    expect(both.deliverables.map((f) => f.path)).toEqual([deck]);
+    expect(both.intermediates.map((f) => f.path)).toEqual([preview]);
+
+    const previewOnly = groupTurnFiles([
+      { path: preview, kind: 'created', category: 'deliverable' },
+      { path: deck, kind: 'created', category: 'intermediate' },
+    ]);
+    expect(previewOnly.deliverables.map((f) => f.path)).toEqual([deck]);
+    expect(previewOnly.intermediates.map((f) => f.path)).toEqual([preview]);
+  });
+
+  it('后端已解析时保留结构化声明的两个同名 output', () => {
+    const deck = '/work/介绍.pptx';
+    const pdf = '/work/介绍.pdf';
+    const grouped = groupTurnFiles([
+      {
+        path: deck,
+        kind: 'created',
+        category: 'deliverable',
+        selection: 'resolved',
+        deliverySource: 'generation',
+      },
+      {
+        path: pdf,
+        kind: 'created',
+        category: 'deliverable',
+        selection: 'resolved',
+        deliverySource: 'generation',
+      },
+    ]);
+
+    expect(grouped.deliverables.map((file) => file.path)).toEqual([deck, pdf]);
+    expect(grouped.intermediates).toEqual([]);
+  });
+
+  it('旧历史记录也折叠预览子目录里的同名 PDF', () => {
+    const deck = '/work/王泰-自我介绍-v4.pptx';
+    const preview = '/work/preview4/王泰-自我介绍-v4-预览.pdf';
+    const grouped = groupTurnFiles([
+      { path: preview, kind: 'created', category: 'deliverable' },
+      { path: deck, kind: 'created', category: 'deliverable' },
+    ]);
+
+    expect(grouped.deliverables.map((file) => file.path)).toEqual([deck]);
+    expect(grouped.intermediates.map((file) => file.path)).toEqual([preview]);
+  });
+});
+
+describe('previewPathForTurn', () => {
+  it('交付的幻灯片优先于同轮的脚本和 Markdown', () => {
+    expect(previewPathForTurn([
+      { path: '/work/build.py', kind: 'created' },
+      { path: '/work/notes.md', kind: 'created' },
+      { path: '/work/deck.pptx', kind: 'created', category: 'deliverable' },
+    ])).toBe('/work/deck.pptx');
+  });
+
+  it('没有可预览文件时返回空', () => {
+    expect(previewPathForTurn([
+      { path: '/work/build.py', kind: 'modified' },
+    ])).toBeNull();
+    expect(previewPathForTurn(undefined)).toBeNull();
+  });
+});
+
+describe('followedPreviewPath', () => {
+  const older = { id: 'a1', files: [{ path: '/work/old.md', kind: 'created' as const }] };
+  const latest = { id: 'a2', files: [{ path: '/work/deck.pptx', kind: 'created' as const, category: 'deliverable' as const }] };
+
+  it('停在底部时用最近一轮能预览的文件', () => {
+    expect(followedPreviewPath([older, { id: 'a-empty' }, latest], {
+      atBottom: true,
+      focusedId: 'a1',
+    })).toEqual({ messageId: 'a2', path: '/work/deck.pptx' });
+  });
+
+  it('往上翻时只看当前这条，没有文件就不改', () => {
+    expect(followedPreviewPath([older, latest], {
+      atBottom: false,
+      focusedId: 'a1',
+    })).toEqual({ messageId: 'a1', path: '/work/old.md' });
+    expect(followedPreviewPath([older, { id: 'a-empty' }], {
+      atBottom: false,
+      focusedId: 'a-empty',
+    })).toBeNull();
   });
 });

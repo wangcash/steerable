@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { AppReleaseSnapshot } from '@/lib/electron-bridge';
+import type { AppReleaseSnapshot } from '@/lib/host-bridge';
 
 const app = vi.hoisted(() => ({
   snapshot: vi.fn<() => Promise<AppReleaseSnapshot>>(),
@@ -9,8 +9,8 @@ const app = vi.hoisted(() => ({
   onState: vi.fn(() => () => {}),
 }));
 
-vi.mock('@/lib/electron-bridge', () => ({
-  getElectronBridge: () => ({ app }),
+vi.mock('@/lib/host-bridge', () => ({
+  getHostBridge: () => ({ app }),
 }));
 
 const { AppUpdateSettingsPanel } = await import('./AppUpdateSettingsPanel');
@@ -58,11 +58,11 @@ describe('AppUpdateSettingsPanel', () => {
     });
     render(<AppUpdateSettingsPanel />);
 
-    expect(await screen.findByText('重启并安装 0.3.0')).toBeTruthy();
+    expect(await screen.findByText('Restart and install 0.3.0')).toBeTruthy();
     fireEvent.click(screen.getByTestId('settings-app-update'));
     await waitFor(() => {
       expect(app.install).toHaveBeenCalledOnce();
-      expect(screen.getByTestId('settings-app-update').textContent).toBe('正在安装');
+      expect(screen.getByTestId('settings-app-update').textContent).toBe('Installing');
     });
     expect(app.check).not.toHaveBeenCalled();
   });

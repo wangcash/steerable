@@ -30,23 +30,32 @@ import { getProductConfig } from '../product-config.js';
 import { LocalBackendRouter } from '../local-backend/router.js';
 import { WorktreeService } from '../local-backend/worktree-service.js';
 import { TaskService } from '../local-backend/task-service.js';
+import { LoopPtyMonitor } from '../local-backend/loop-pty-monitor.js';
 import {
   LOCAL_SCOPE,
   closeStorage,
   getPackDbAccess,
   getScopedStore,
   initializeStorage,
+  watchStorageChanges,
   type PackDbAccess,
   type PackDbParams,
   type PackDbRunResult,
   type TenantScope,
 } from '../storage/driver.js';
+import { getUserDataDir } from '../runtime.js';
+import {
+  acquireInstanceLease,
+  bindStorageInstance,
+  type InstanceLease,
+} from '../storage/process-locks.js';
 import { createApprovalBridge } from '../sidecar/reverse-approval.js';
 import { createAskUserBridge } from '../sidecar/reverse-ask-user.js';
 import { startHostSidecar, shutdownHostSidecar } from '../sidecar/boot.js';
 import { createVisibleTerminalExec } from './visible-terminal-exec.js';
 import { createJsonStore } from '../json-store.js';
 import { bindWorkspaceSkillRoots } from '../local-backend/skill-loader.js';
+import { collectPackExecWritableRoots } from '../local-backend/pack-turn-hooks.js';
 import { getChatAttachmentsDir } from '../attachments.js';
 import { ensureChatWorkspace } from '../project-home.js';
 import { recordInsightTurn } from '../insights/record.js';
@@ -57,6 +66,7 @@ import {
   type PackAssemblyDeps,
   type PackAssemblyHandle,
 } from './pack-assembly.js';
+import { registerPackHttpRoutes } from './http-routes.js';
 
 export interface HostRuntimeOptions {
   /** Storage ownership for this host process. Defaults to local personal use. */
@@ -110,6 +120,7 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
   const { broadcast, hasWindow, onLog } = options;
   const broadcastMain = options.broadcastMain ?? broadcast;
   await initializeStorage();
+  watchStorageChanges(() => broadcast('store:changed', {}));
   const scope = options.scope ?? LOCAL_SCOPE;
   const defaultStore = getScopedStore(scope);
   let localBackendRouter: LocalBackendRouter | undefined;
@@ -241,6 +252,10 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
       if (handle) packHandles.set(packId, handle);
     }
   }
+  for (const [packId, handle] of packHandles) {
+    const routes = handle.httpRoutes?.();
+    if (routes && routes.length > 0) registerPackHttpRoutes(packId, routes);
+  }
   const worktreeService = new WorktreeService({ resolveProject: resolveChatProjectRoot });
   const taskService = new TaskService({
     store: () => localBackendRouter?.activeStore ?? defaultStore,
@@ -264,6 +279,12 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     taskService,
     broadcast: broadcastMain,
   });
+  const loopMonitor = new LoopPtyMonitor(
+    terminalManager,
+    (chatId, input) => localBackendRouter!.wakeChat(chatId, input),
+    (chatId, loops) => broadcastMain('loop-changed', { chatId, loops }),
+  );
+  toolRouter.setLoopMonitor(loopMonitor);
 
   // W4-1 / W8：sidecar 反向通道的审批桥与提问桥。
   const approvalBridge = createApprovalBridge({
@@ -278,6 +299,8 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
   });
 
   let started = false;
+  let instanceLease: InstanceLease | null = null;
+  let warmTimer: ReturnType<typeof setTimeout> | null = null;
 
   return {
     store: defaultStore,
@@ -299,8 +322,9 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
       if (started) return;
       started = true;
 
-      // 4.6a：上次进程崩溃/强杀留下的 running 任务不是真相——任务流随进程
-      // 一起死了，启动时落成 failed，任务面板据此显示"重启中断"。
+      instanceLease = acquireInstanceLease(getUserDataDir());
+      bindStorageInstance(instanceLease.instanceId);
+      // 只清扫所属进程已经退出的任务。本进程的实例锁还在，不会扫到自己。
       const sweptTasks = await defaultStore.failRunningTasks(options.taskSweepReason);
       if (sweptTasks > 0) {
         onLog(`[task] swept ${sweptTasks} stale running task(s)`);
@@ -313,8 +337,7 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
         toolRouter,
         resolveProjectRoot: async (chatId) =>
           localBackendRouter.resolveChatWorkspaceRoot(chatId),
-        // 读：项目家目录之外，附件目录和源文件夹（含各自子目录）也可读。
-        // 写：源文件夹及其子目录与家目录同一档；附件目录保持只读。
+        // 写：源文件夹、包声明的可写根，以及各自的子目录。附件目录保持只读。
         resolveAdditionalReadRoots: async (chatId) => {
           const project = await localBackendRouter.resolveChatProject(chatId);
           return [
@@ -324,7 +347,10 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
         },
         resolveAdditionalWriteRoots: async (chatId) => {
           const project = await localBackendRouter.resolveChatProject(chatId);
-          return project?.sourceFolders ?? [];
+          return [
+            ...(project?.sourceFolders ?? []),
+            ...collectPackExecWritableRoots(chatId),
+          ];
         },
         approvalHandler: approvalBridge.handler,
         askUserHandler: askUserBridge.handler,
@@ -344,7 +370,8 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
       // 后台刷新已启用 MCP 服务的工具列表（连接慢的 server 不阻塞启动）。
       void mcpServerRegistry.refreshAllEnabled();
       // 预热共享可见 PTY：首条 agent 命令不必付 shell 启动成本。
-      setTimeout(() => {
+      // 短命进程在这两秒内退出时必须取消，否则定时器会在关停之后再拉起一个 shell。
+      warmTimer = setTimeout(() => {
         try {
           terminalManager.ensurePrimary();
         } catch (err) {
@@ -354,6 +381,11 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
     },
 
     async shutdown(): Promise<void> {
+      if (warmTimer) {
+        clearTimeout(warmTimer);
+        warmTimer = null;
+      }
+      loopMonitor.dispose();
       terminalManager.killAll();
       // 包装配逆序关停（后装配的先停）。
       for (const handle of [...packHandles.values()].reverse()) {
@@ -361,6 +393,9 @@ export async function createHostRuntime(options: HostRuntimeOptions): Promise<Ho
       }
       await mcpExecutor.shutdownAll();
       await shutdownHostSidecar();
+      instanceLease?.release();
+      instanceLease = null;
+      bindStorageInstance(null);
       await closeStorage();
     },
   };

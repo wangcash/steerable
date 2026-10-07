@@ -27,12 +27,23 @@ import {
   resetRouterTestkit,
 } from './router-testkit.js';
 import { LocalBackendRouter, userFacingCoreLoopFailure } from '../../src/local-backend/router.js';
+import { ProjectRegistry, type ProjectRecord } from '../../src/project-registry.js';
 import { SidecarSupervisor } from '../../src/sidecar/index.js';
 import type { ToolRouter } from '../../src/tool-router.js';
 import type { TaskService } from '../../src/local-backend/task-service.js';
 import { registerAuthProvider, type Principal } from '../../src/auth/index.js';
 import type { ScopedStore } from '../../src/storage/scoped-store.js';
 import { setProductConfig } from '../../src/product-config.js';
+
+function memoryProjectStore() {
+  let data: ProjectRecord[] = [];
+  return {
+    get: (key: 'projects') => (key === 'projects' ? data : undefined),
+    set: (key: 'projects', value: ProjectRecord[]) => {
+      if (key === 'projects') data = value;
+    },
+  };
+}
 
 function makeRouter(options: {
   toolRouter?: Record<string, unknown>;
@@ -252,6 +263,35 @@ describe('会话路由', () => {
     expect(data.projectId).toBeNull();
     expect(data.isTemporary).toBe(false);
     expect(await h.store.getChat(data.chatId)).not.toBeNull();
+  });
+
+  it('POST compact folds older messages, fork copies them, and rewind drops the newest user turn', async () => {
+    const chat = await h.store.createChat('原对话', 'agent-a', null);
+    await h.store.addMessage(chat.id, 'user', '较早问题');
+    await h.store.addMessage(chat.id, 'assistant', '较早回答');
+    await h.store.addMessage(chat.id, 'user', '最新问题');
+    await h.store.addMessage(chat.id, 'assistant', '最新回答');
+    const router = makeRouter();
+    const compacted = await router.handle({ method: 'POST', path: `/api/v2/chats/${chat.id}/compact` });
+    expect(compacted).toMatchObject({ status: 200, data: { compacted: 2 } });
+    const folded = (await h.store.listMessages(chat.id)).map((message) => message.content);
+    expect(folded[0]).toBe('最新回答');
+    expect(folded[1]).toBe('最新问题');
+    expect(folded[2]).toContain('已压缩 2 条');
+    expect(folded[2]).toContain('较早问题');
+
+    const forked = await router.handle({ method: 'POST', path: `/api/v2/chats/${chat.id}/fork` });
+    const forkId = (forked.data as { chatId?: string }).chatId ?? '';
+    expect(forked.status).toBe(200);
+    expect((await h.store.listMessages(forkId)).map((message) => message.content)).toEqual([
+      '最新回答',
+      '最新问题',
+      folded[2],
+    ]);
+
+    const rewound = await router.handle({ method: 'POST', path: `/api/v2/chats/${forkId}/rewind` });
+    expect(rewound).toMatchObject({ status: 200, data: { removed: 2 } });
+    expect((await h.store.listMessages(forkId)).map((message) => message.content)).toEqual([folded[2]]);
   });
 
   it('无项目对话工作区落在 Documents/应用名/conversations/<chatId>', async () => {
@@ -645,6 +685,49 @@ describe('项目路由', () => {
       body: { name: '演示', folderPath: '/tmp/demo' },
     });
     expect(created.status).toBe(403);
+    const order = await router.handle({
+      method: 'PUT',
+      path: '/api/v2/projects/order',
+      body: { orderedIds: [] },
+    });
+    expect(order.status).toBe(403);
+  });
+
+  it('PUT /api/v2/projects/order 按 id 重排；非法名单 400；无注册表 503', async () => {
+    const missing = await makeRouter().handle({
+      method: 'PUT',
+      path: '/api/v2/projects/order',
+      body: { orderedIds: [] },
+    });
+    expect(missing.status).toBe(503);
+
+    const store = memoryProjectStore();
+    const registry = new ProjectRegistry(store);
+    const first = registry.create({ name: '甲', folderPath: '/tmp/a' });
+    const second = registry.create({ name: '乙', folderPath: '/tmp/b' });
+    const router = makeRouter({ toolRouter: makeToolRouter({ projectRegistry: registry }) });
+
+    const bad = await router.handle({
+      method: 'PUT',
+      path: '/api/v2/projects/order',
+      body: { orderedIds: [first.id, 2] },
+    });
+    expect(bad.status).toBe(400);
+
+    const moved = await router.handle({
+      method: 'PUT',
+      path: '/api/v2/projects/order',
+      body: { orderedIds: [second.id, first.id] },
+    });
+    expect(moved.status).toBe(200);
+    expect(
+      ((moved.data as { projects: Array<{ name: string }> }).projects).map((project) => project.name),
+    ).toEqual(['乙', '甲']);
+
+    const list = await router.handle({ method: 'GET', path: '/api/v2/projects' });
+    expect(
+      ((list.data as { projects: Array<{ id: string }> }).projects).map((project) => project.id),
+    ).toEqual([second.id, first.id]);
   });
 
   it('POST 不带 folderPath 时分配默认家目录并创建', async () => {
@@ -1651,6 +1734,29 @@ describe('Insights 与用量路由', () => {
     const failed = await router.handle({ method: 'POST', path: '/api/v2/insights/upload-local' });
     expect(failed.status).toBe(502);
     expect((failed.data as Record<string, any>).detail).toBe('upload_failed_kept_local');
+  });
+
+  it('GET /api/v2/llm/account：未保存设置时不带着空密钥去请求 DeepSeek', async () => {
+    const res = await makeRouter().handle({ method: 'GET', path: '/api/v2/llm/account' });
+    expect(res.status).toBe(200);
+    expect(res.data).toMatchObject({
+      status: 'missing_key',
+      provider: 'deepseek',
+      label: 'DeepSeek',
+    });
+  });
+
+  it('GET /api/v2/llm/account：其他供应商不查询余额', async () => {
+    await h.store.setLlmSettings({
+      provider: 'openai-compat',
+      vendorId: 'openai',
+      model: 'gpt-4o',
+      baseUrl: 'https://api.openai.com/v1',
+      apiKey: 'sk-test',
+    });
+    const res = await makeRouter().handle({ method: 'GET', path: '/api/v2/llm/account' });
+    expect(res.status).toBe(200);
+    expect(res.data).toMatchObject({ status: 'unsupported', provider: null });
   });
 
   it('GET /api/v2/usage/summary：days 参数透传，非法值回落 30', async () => {

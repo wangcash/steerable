@@ -17,8 +17,12 @@ export interface TurnFile {
   additions?: number;
   /** 删除行数（展示用，如 -0）。 */
   deletions?: number;
-  /** 类别：deliverable = present_files 声明的最终交付文件；intermediate = 其余本轮写过的文件。 */
+  /** 类别：deliverable = 本轮交付卡片；intermediate = 其余本轮写过的文件。 */
   category?: 'deliverable' | 'intermediate';
+  /** 后端已经按分层证据完成选择；前端必须原样采用 category。 */
+  selection?: 'resolved';
+  /** 交付选择的来源，供调试和后续展示使用。 */
+  deliverySource?: 'generation' | 'final-reference' | 'present-files' | 'inference';
   /** present_files 给出的一行说明（交付卡片副标题）。 */
   description?: string;
 }
@@ -40,6 +44,13 @@ export function parseTurnFiles(raw: unknown): TurnFile[] | null {
       ...(typeof rec.deletions === 'number' ? { deletions: rec.deletions } : {}),
       ...(rec.category === 'deliverable' || rec.category === 'intermediate'
         ? { category: rec.category }
+        : {}),
+      ...(rec.selection === 'resolved' ? { selection: rec.selection } : {}),
+      ...(rec.deliverySource === 'generation' ||
+      rec.deliverySource === 'final-reference' ||
+      rec.deliverySource === 'present-files' ||
+      rec.deliverySource === 'inference'
+        ? { deliverySource: rec.deliverySource }
         : {}),
       ...(typeof rec.description === 'string' && rec.description
         ? { description: rec.description }
@@ -103,8 +114,8 @@ export const DELIVERABLE_EXTENSIONS = new Set([
 ]);
 
 /**
- * 后端按 present_files 声明给出 category；没有 category 的是声明机制上线前
- * 落库的消息，退回扩展名规则。
+ * 单文件扩展名猜测。回合里有多份文件时，`groupTurnFiles` 会再拿掉同名预览。
+ * 没有 category 的是声明机制上线前落库的消息。
  */
 export function getTurnFileCategory(file: TurnFile): 'deliverable' | 'intermediate' {
   if (file.category) return file.category;
@@ -141,7 +152,7 @@ export function getDeliverableMeta(filePath: string): DeliverableFileMeta {
     case '.tsv':
     case '.numbers':
       return {
-        label: '电子表格',
+        label: 'Spreadsheet',
         extBadge: extClean,
         kind: 'spreadsheet',
         themeColor: 'emerald',
@@ -150,7 +161,7 @@ export function getDeliverableMeta(filePath: string): DeliverableFileMeta {
     case '.ppt': // shell-neutral:allow — Office 幻灯片扩展名，不是产品品牌
     case '.key':
       return {
-        label: '演示文稿',
+        label: 'Presentation',
         extBadge: extClean,
         kind: 'presentation',
         themeColor: 'amber',
@@ -160,14 +171,14 @@ export function getDeliverableMeta(filePath: string): DeliverableFileMeta {
     case '.pages':
     case '.rtf':
       return {
-        label: '文档',
+        label: 'Document',
         extBadge: extClean,
         kind: 'document',
         themeColor: 'blue',
       };
     case '.pdf':
       return {
-        label: '文档',
+        label: 'Document',
         extBadge: 'PDF',
         kind: 'pdf',
         themeColor: 'rose',
@@ -179,7 +190,7 @@ export function getDeliverableMeta(filePath: string): DeliverableFileMeta {
     case '.webp':
     case '.svg':
       return {
-        label: '图像',
+        label: 'Image',
         extBadge: extClean,
         kind: 'image',
         themeColor: 'purple',
@@ -189,7 +200,7 @@ export function getDeliverableMeta(filePath: string): DeliverableFileMeta {
     case '.gz':
     case '.7z':
       return {
-        label: '压缩包',
+        label: 'Archive',
         extBadge: extClean,
         kind: 'archive',
         themeColor: 'amber',
@@ -197,14 +208,14 @@ export function getDeliverableMeta(filePath: string): DeliverableFileMeta {
     case '.html':
     case '.htm':
       return {
-        label: '网页',
+        label: 'Web page',
         extBadge: 'HTML',
         kind: 'document',
         themeColor: 'blue',
       };
     default:
       return {
-        label: '文件',
+        label: 'File',
         extBadge: extClean,
         kind: 'file',
         themeColor: 'slate',
@@ -247,6 +258,54 @@ function parseDiffStats(diffText: string): { additions: number; deletions: numbe
   return { additions, deletions };
 }
 
+const SOURCE_EXTENSIONS = new Set([
+  '.pptx', '.ppt', '.key', // shell-neutral:allow — Office 幻灯片扩展名，不是产品品牌
+  '.docx', '.doc', '.pages',
+  '.xlsx', '.xls', '.xlsm', '.numbers',
+]);
+
+const PREVIEW_NAME = /预览|截图|图像版|preview|screenshot|thumbnail/i;
+
+/**
+ * 旧消息没有 selection=resolved，只纠正最明确的一种历史误判：同目录的
+ * 幻灯片与预览 PDF / 截图都被标成交付物。新消息完全采用后端结论。
+ */
+function selectLegacyDeliverablePaths(files: readonly TurnFile[]): Set<string> {
+  const chosen = new Set(
+    files.filter((file) => getTurnFileCategory(file) === 'deliverable').map((file) => file.path),
+  );
+  const sources = files
+    .filter((file) => SOURCE_EXTENSIONS.has(getFileExtension(file.path)))
+    .map((file) => file.path);
+  for (const candidate of [...chosen]) {
+    const source = sources.find((item) => isLegacyPreviewOf(candidate, item));
+    if (!source) continue;
+    chosen.delete(candidate);
+    chosen.add(source);
+  }
+  return new Set(chosen);
+}
+
+function isLegacyPreviewOf(filePath: string, sourcePath: string): boolean {
+  if (filePath === sourcePath || getFileExtension(sourcePath) !== '.pptx') return false; // shell-neutral:allow — Office extension
+  const ext = getFileExtension(filePath);
+  if (ext !== '.pdf' && !['.png', '.jpg', '.jpeg', '.webp'].includes(ext)) return false;
+  const file = splitTurnFilePath(filePath);
+  const source = splitTurnFilePath(sourcePath);
+  const normalized = (name: string) =>
+    name
+      .replace(/\.[^.]+$/, '')
+      .replace(PREVIEW_NAME, '')
+      .replace(/[\s._\-—–()（）【】[\]]+/g, '')
+      .toLowerCase()
+      .normalize('NFC');
+  if (normalized(file.name) === normalized(source.name)) return true;
+  return (
+    PREVIEW_NAME.test(file.name) &&
+    file.dir.normalize('NFC') === source.dir.normalize('NFC')
+  );
+}
+
 /** 把本轮文件按最终交付物（最终文件）与中间修改文件分类，并合并行数统计。 */
 export function groupTurnFiles(
   files: TurnFile[],
@@ -287,8 +346,16 @@ export function groupTurnFiles(
   let totalAdditions = 0;
   let totalDeletions = 0;
 
+  const backendResolved =
+    validFiles.length > 0 && validFiles.every((file) => file.selection === 'resolved');
+  const deliverablePaths = backendResolved
+    ? new Set(
+        validFiles.filter((file) => file.category === 'deliverable').map((file) => file.path),
+      )
+    : selectLegacyDeliverablePaths(validFiles);
+
   for (const file of validFiles) {
-    const cat = getTurnFileCategory(file);
+    const cat = deliverablePaths.has(file.path) ? 'deliverable' : 'intermediate';
     // 匹配统计：尝试直接匹配或 basename 匹配
     let stats = statsByPath.get(file.path);
     if (!stats) {
@@ -320,4 +387,61 @@ export function groupTurnFiles(
   }
 
   return { deliverables, intermediates, totalAdditions, totalDeletions };
+}
+
+/** 右侧栏能直接打开的扩展名。交付物优先，同层里靠前的类型优先。 */
+const RIGHT_PREVIEW_EXTENSIONS = [
+  '.pptx', // shell-neutral:allow — Office 幻灯片扩展名，不是产品品牌
+  '.ppt', // shell-neutral:allow — Office 幻灯片扩展名，不是产品品牌
+  '.docx',
+  '.doc',
+  '.md',
+  '.markdown',
+];
+
+/**
+ * 这一轮在右侧栏里该显示的文件。
+ * 交付物压过脚本和中间产物；同一层里幻灯片、文档、Markdown 依次优先。
+ */
+export function previewPathForTurn(files: readonly TurnFile[] | undefined): string | null {
+  if (!files || files.length === 0) return null;
+  let best: { path: string; rank: number; deliverable: boolean } | null = null;
+  for (const file of files) {
+    if (isIgnoredTurnFile(file.path)) continue;
+    const rank = RIGHT_PREVIEW_EXTENSIONS.indexOf(getFileExtension(file.path));
+    if (rank < 0) continue;
+    const deliverable = getTurnFileCategory(file) === 'deliverable';
+    if (
+      !best
+      || (deliverable && !best.deliverable)
+      || (deliverable === best.deliverable && rank < best.rank)
+    ) {
+      best = { path: file.path, rank, deliverable };
+    }
+  }
+  return best?.path ?? null;
+}
+
+/**
+ * 右侧预览跟着对话走。
+ * 停在底部时用最近一轮有预览的产物；往上翻时只用当前看着的那条助手消息。
+ */
+export function followedPreviewPath(
+  ordered: readonly { id: string; files?: readonly TurnFile[] }[],
+  options: { atBottom: boolean; focusedId: string | null },
+): { messageId: string; path: string } | null {
+  const pick = (entry: { id: string; files?: readonly TurnFile[] } | undefined) => {
+    if (!entry) return null;
+    const path = previewPathForTurn(entry.files);
+    return path ? { messageId: entry.id, path } : null;
+  };
+  if (options.atBottom) {
+    for (let index = ordered.length - 1; index >= 0; index -= 1) {
+      const found = pick(ordered[index]);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (!options.focusedId) return null;
+  return pick(ordered.find((entry) => entry.id === options.focusedId));
 }
